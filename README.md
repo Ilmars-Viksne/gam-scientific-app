@@ -423,9 +423,7 @@ role: smooth
 The predictor receives a univariate B-spline effect:
 
 $$
-f_{jk}(x_j)
-=
-\sum_m \theta_{jkm} B_{jm}(x_j).
+f_{jk}(x_j) = \sum_m \theta_{jkm} B_{jm}(x_j).
 $$
 
 ## Linear
