@@ -1,0 +1,30 @@
+schema_version: "1.0"
+experiment:
+  name: "quick-demo"
+  primary_metric: "log_loss"
+data:
+  path: "demo.csv"
+  target: "Y"
+  row_id: null
+features:
+  X1: {role: smooth, missing: error}
+  X2: {role: smooth, missing: error}
+  X3: {role: categorical, missing: error}
+  X4: {role: linear, missing: error}
+models:
+  - {id: gam_main, interactions: none}
+  - {id: gam_pairwise, interactions: all_eligible}
+validation:
+  outer_splits: 3
+  outer_repeats: 1
+  inner_splits: 3
+  random_state: 42
+search:
+  n_knots: [3]
+  degree: [2]
+  C: [0.1, 1.0]
+  interaction_scale: [0.5, 1.0]
+execution:
+  workers: 1
+  checkpoint_unit: outer_fold
+  stop_on_convergence_warning: true

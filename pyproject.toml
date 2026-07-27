@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gam-scientific-app"
+version = "0.1.0"
+description = "Configuration-driven multiclass GAM experiments for tabular data"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "joblib>=1.4",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyarrow>=16",
+  "PyYAML>=6.0",
+  "scikit-learn>=1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[project.scripts]
+gam-app = "gam_app.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gam_app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+check_untyped_defs = true
