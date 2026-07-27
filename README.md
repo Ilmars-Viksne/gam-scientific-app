@@ -495,8 +495,7 @@ All fitted preprocessing occurs inside the model pipeline and is learned from tr
 The class score has the general form:
 
 $$
-\eta_k(\mathbf{x})
-=
+\eta_k(\mathbf{x}) =
 \beta_{0k}
 +\sum_j f_{jk}(x_j)
 +\sum_l \beta_{lk}\widetilde{x}_l
@@ -513,8 +512,7 @@ $$
 Every pair among smooth predictors is included:
 
 $$
-\eta_k(\mathbf{x})
-=
+\eta_k(\mathbf{x}) =
 \beta_{0k}
 +\sum_j f_{jk}(x_j)
 +\sum_{(r,s)} f_{rsk}(x_r,x_s).
@@ -548,8 +546,7 @@ Both model types use:
 Class probabilities are:
 
 $$
-P(Y=k\mid\mathbf{x})
-=
+P(Y=k\mid\mathbf{x}) =
 \frac{\exp(\eta_k)}
 {\sum_{\ell}\exp(\eta_\ell)}.
 $$
