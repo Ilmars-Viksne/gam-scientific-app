@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
-import yaml
 
 from .config import load_config
 from .data import infer_role, load_table, profile_data, save_profile
@@ -21,9 +20,30 @@ from .workflow import create_run, execute_run
 
 def _preset(name: str) -> dict:
     presets = {
-        "quick": {"outer_splits": 3, "outer_repeats": 1, "inner_splits": 3, "n_knots": [3], "degree": [2], "C": [0.1, 1.0, 10.0]},
-        "standard": {"outer_splits": 5, "outer_repeats": 3, "inner_splits": 5, "n_knots": [3, 4, 5], "degree": [2, 3], "C": [0.01, 0.1, 1.0, 10.0]},
-        "thorough": {"outer_splits": 5, "outer_repeats": 5, "inner_splits": 5, "n_knots": [3, 4, 5, 6], "degree": [2, 3], "C": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]},
+        "quick": {
+            "outer_splits": 3,
+            "outer_repeats": 1,
+            "inner_splits": 3,
+            "n_knots": [3],
+            "degree": [2],
+            "C": [0.1, 1.0, 10.0],
+        },
+        "standard": {
+            "outer_splits": 5,
+            "outer_repeats": 3,
+            "inner_splits": 5,
+            "n_knots": [3, 4, 5],
+            "degree": [2, 3],
+            "C": [0.01, 0.1, 1.0, 10.0],
+        },
+        "thorough": {
+            "outer_splits": 5,
+            "outer_repeats": 5,
+            "inner_splits": 5,
+            "n_knots": [3, 4, 5, 6],
+            "degree": [2, 3],
+            "C": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
+        },
     }
     return presets[name]
 
@@ -41,39 +61,116 @@ def _ask(prompt: str, default: str) -> str:
 
 def command_configure(args) -> None:
     frame = load_table(args.data)
+
     if args.target not in frame.columns:
         raise ValueError(f"Target {args.target!r} is absent.")
-    features = {}
+
+    features: dict[str, dict[str, Any]] = {}
+
     for name in frame.columns:
         if name == args.target:
             continue
+
         recommended, reason = infer_role(frame[name])
         role = recommended
+
         if not args.non_interactive:
             print(f"\n{name}: {reason}; recommended role={recommended}")
-            role = _ask("Role (smooth/linear/categorical/exclude)", recommended)
-        spec = {"role": role, "missing": "error"}
+
+            role = _ask(
+                "Role (smooth/linear/categorical/exclude)",
+                recommended,
+            )
+
+        if role not in {
+            "smooth",
+            "linear",
+            "categorical",
+            "exclude",
+        }:
+            raise ValueError(f"Invalid role {role!r} selected for feature {name!r}.")
+
+        spec: dict[str, Any] = {
+            "role": role,
+            "missing": "error",
+        }
+
         if role == "categorical":
-            spec["categories"] = [str(value) for value in sorted(frame[name].dropna().unique(), key=str)]
+            category_values = sorted(
+                frame[name].dropna().unique(),
+                key=str,
+            )
+
+            spec["categories"] = [str(value) for value in category_values]
+
         features[name] = spec
+
     preset = args.preset
+
     if not args.non_interactive:
-        preset = _ask("Search preset (quick/standard/thorough)", preset)
-    values = _preset(preset)
-    payload = {
+        preset = _ask(
+            "Search preset (quick/standard/thorough)",
+            preset,
+        )
+
+    if preset not in {
+        "quick",
+        "standard",
+        "thorough",
+    }:
+        raise ValueError(f"Invalid search preset: {preset!r}.")
+
+    preset_values: dict[str, Any] = _preset(preset)
+
+    payload: dict[str, Any] = {
         "schema_version": "1.0",
-        "experiment": {"name": args.name or args.data.stem, "primary_metric": "log_loss"},
-        "data": {"path": str(args.data.resolve()), "target": args.target, "row_id": args.row_id},
+        "experiment": {
+            "name": args.name or args.data.stem,
+            "primary_metric": "log_loss",
+        },
+        "data": {
+            "path": str(args.data.resolve()),
+            "target": args.target,
+            "row_id": args.row_id,
+        },
         "features": features,
         "models": [
-            {"id": "gam_main", "interactions": "none"},
-            {"id": "gam_pairwise", "interactions": "all_eligible"},
+            {
+                "id": "gam_main",
+                "interactions": "none",
+            },
+            {
+                "id": "gam_pairwise",
+                "interactions": "all_eligible",
+            },
         ],
-        "validation": {"outer_splits": values["outer_splits"], "outer_repeats": values["outer_repeats"], "inner_splits": values["inner_splits"], "random_state": 42},
-        "search": {"n_knots": values["n_knots"], "degree": values["degree"], "C": values["C"], "interaction_scale": [0.5, 1.0]},
-        "execution": {"workers": 1, "checkpoint_unit": "outer_fold", "stop_on_convergence_warning": True},
+        "validation": {
+            "outer_splits": preset_values["outer_splits"],
+            "outer_repeats": preset_values["outer_repeats"],
+            "inner_splits": preset_values["inner_splits"],
+            "random_state": 42,
+        },
+        "search": {
+            "n_knots": preset_values["n_knots"],
+            "degree": preset_values["degree"],
+            "C": preset_values["C"],
+            "interaction_scale": [
+                0.5,
+                1.0,
+            ],
+        },
+        "execution": {
+            "workers": 1,
+            "checkpoint_unit": "outer_fold",
+            "stop_on_convergence_warning": True,
+        },
     }
-    write_yaml_atomic(args.output, payload)
+
+    write_yaml_atomic(
+        args.output,
+        payload,
+    )
+
     print(f"Configuration written to {args.output.resolve()}")
 
 
@@ -85,8 +182,13 @@ def command_plan(args) -> None:
     rows = []
     for model in config.models:
         candidates = main if model.interactions == "none" else pairwise
-        fits = candidates * config.validation.inner_splits * outer + candidates * config.validation.inner_splits
-        rows.append({"model": model.id, "candidates": candidates, "estimated_fits": fits})
+        fits = (
+            candidates * config.validation.inner_splits * outer
+            + candidates * config.validation.inner_splits
+        )
+        rows.append(
+            {"model": model.id, "candidates": candidates, "estimated_fits": fits}
+        )
     print(pd.DataFrame(rows).to_string(index=False))
 
 
@@ -146,13 +248,22 @@ def command_verify_link(args) -> None:
 def command_compare(args) -> None:
     left = pd.read_csv(args.left / "results" / args.left_model / "fold_metrics.csv")
     right = pd.read_csv(args.right / "results" / args.right_model / "fold_metrics.csv")
-    merged = left.merge(right, on=["repeat", "fold"], suffixes=("_left", "_right"), validate="one_to_one")
+    merged = left.merge(
+        right,
+        on=["repeat", "fold"],
+        suffixes=("_left", "_right"),
+        validate="one_to_one",
+    )
     metrics = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
     for metric in metrics:
-        merged[f"{metric}_difference"] = merged[f"{metric}_right"] - merged[f"{metric}_left"]
+        merged[f"{metric}_difference"] = (
+            merged[f"{metric}_right"] - merged[f"{metric}_left"]
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     merged.to_csv(args.output / "comparison.csv", index=False)
-    merged[[f"{metric}_difference" for metric in metrics]].agg(["mean", "std", "median"]).T.to_csv(args.output / "summary.csv")
+    merged[[f"{metric}_difference" for metric in metrics]].agg(
+        ["mean", "std", "median"]
+    ).T.to_csv(args.output / "summary.csv")
     print((args.output / "summary.csv").read_text(encoding="utf-8"))
 
 
@@ -161,7 +272,9 @@ def command_predict(args) -> None:
     frame = load_table(args.input)
     probabilities = model.predict_proba(frame)
     classes = model.named_steps["classifier"].classes_
-    output = pd.DataFrame(probabilities, columns=[f"probability_{name}" for name in classes])
+    output = pd.DataFrame(
+        probabilities, columns=[f"probability_{name}" for name in classes]
+    )
     output["predicted_class"] = classes[np.argmax(probabilities, axis=1)]
     output.to_csv(args.output, index=False)
     print(f"Predictions written to {args.output.resolve()}")
@@ -174,12 +287,14 @@ def command_demo(args) -> None:
     x2 = rng.uniform(-2, 2, size=n)
     x3 = rng.choice(["low", "standard", "high"], size=n)
     x4 = rng.normal(size=n)
-    scores = np.column_stack([
-        1.2 * np.sin(x1) - 0.5 * x2,
-        -0.8 * x1 + 0.7 * x2**2,
-        0.6 * x1 * x2 + 0.4 * x4,
-        -0.4 * x2 - 0.5 * x4,
-    ])
+    scores = np.column_stack(
+        [
+            1.2 * np.sin(x1) - 0.5 * x2,
+            -0.8 * x1 + 0.7 * x2**2,
+            0.6 * x1 * x2 + 0.4 * x4,
+            -0.4 * x2 - 0.5 * x4,
+        ]
+    )
     probabilities = np.exp(scores - scores.max(axis=1, keepdims=True))
     probabilities /= probabilities.sum(axis=1, keepdims=True)
     labels = np.array(["A", "B", "C", "D"])
@@ -204,7 +319,9 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--output", type=Path, required=True)
     configure.add_argument("--name")
     configure.add_argument("--row-id")
-    configure.add_argument("--preset", choices=["quick", "standard", "thorough"], default="standard")
+    configure.add_argument(
+        "--preset", choices=["quick", "standard", "thorough"], default="standard"
+    )
     configure.add_argument("--non-interactive", action="store_true")
     configure.set_defaults(func=command_configure)
     plan = sub.add_parser("plan")
@@ -228,7 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect")
     inspect.add_argument("--run", type=Path, required=True)
     inspect.add_argument("--model", required=True)
-    inspect.add_argument("--reference-class", default="O")
+    inspect.add_argument(
+        "--reference-class",
+        default=None,
+        help=(
+            "Reference target class for contrast equations. "
+            "Defaults to the classifier's first class."
+        ),
+    )
     inspect.set_defaults(func=command_inspect)
     link = sub.add_parser("verify-link")
     link.add_argument("--run", type=Path, required=True)

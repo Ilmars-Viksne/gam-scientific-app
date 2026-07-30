@@ -33,7 +33,7 @@ class GAMFeatureTransformer(BaseEstimator, TransformerMixin):
         self.degree = degree
         self.interaction_scale = interaction_scale
 
-    def fit(self, X: pd.DataFrame, y: Any = None) -> "GAMFeatureTransformer":
+    def fit(self, X: pd.DataFrame, y: Any = None) -> GAMFeatureTransformer:
         X = self._validate(X)
         policies = dict(self.missing_policies)
         numeric = (*self.smooth_features, *self.linear_features)
@@ -76,7 +76,9 @@ class GAMFeatureTransformer(BaseEstimator, TransformerMixin):
             self.encoder_.fit(X_work.loc[:, self.categorical_features].astype(str))
         total = int(self.spline_.n_features_out_)
         if total % len(self.smooth_features) != 0:
-            raise RuntimeError("Spline outputs do not divide evenly by smooth features.")
+            raise RuntimeError(
+                "Spline outputs do not divide evenly by smooth features."
+            )
         self.basis_count_ = total // len(self.smooth_features)
         self.smooth_index_ = {name: i for i, name in enumerate(self.smooth_features)}
         self.feature_names_out_ = np.asarray(self._names(), dtype=object)
@@ -85,16 +87,28 @@ class GAMFeatureTransformer(BaseEstimator, TransformerMixin):
     def transform(self, X: pd.DataFrame) -> np.ndarray:
         check_is_fitted(self, ["spline_", "feature_names_out_"])
         X_work = self._apply_imputation(self._validate(X))
-        smooth = self.spline_.transform(X_work.loc[:, self.smooth_features].astype(float))
+        smooth = self.spline_.transform(
+            X_work.loc[:, self.smooth_features].astype(float)
+        )
         blocks = [np.asarray(smooth, dtype=float)]
         if self.linear_features:
-            blocks.append(self.scaler_.transform(X_work.loc[:, self.linear_features].astype(float)))
+            blocks.append(
+                self.scaler_.transform(
+                    X_work.loc[:, self.linear_features].astype(float)
+                )
+            )
         if self.categorical_features:
-            blocks.append(self.encoder_.transform(X_work.loc[:, self.categorical_features].astype(str)))
+            blocks.append(
+                self.encoder_.transform(
+                    X_work.loc[:, self.categorical_features].astype(str)
+                )
+            )
         for left, right in self.interaction_pairs:
             left_basis = self._block(smooth, left)
             right_basis = self._block(smooth, right)
-            block = np.einsum("ni,nj->nij", left_basis, right_basis).reshape(len(X_work), -1)
+            block = np.einsum("ni,nj->nij", left_basis, right_basis).reshape(
+                len(X_work), -1
+            )
             blocks.append(block * float(self.interaction_scale))
         result = np.hstack(blocks).astype(float, copy=False)
         if result.shape[1] != len(self.feature_names_out_):
@@ -128,7 +142,9 @@ class GAMFeatureTransformer(BaseEstimator, TransformerMixin):
         if self.categorical_features:
             names.extend(
                 f"main_categorical__{name}"
-                for name in self.encoder_.get_feature_names_out(self.categorical_features)
+                for name in self.encoder_.get_feature_names_out(
+                    self.categorical_features
+                )
             )
         names.extend(
             f"interaction__{left}:{right}__basis_{a}:{b}"
@@ -141,7 +157,11 @@ class GAMFeatureTransformer(BaseEstimator, TransformerMixin):
     def _validate(self, X: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(X, pd.DataFrame):
             raise TypeError("GAMFeatureTransformer requires a pandas DataFrame.")
-        expected = [*self.smooth_features, *self.linear_features, *self.categorical_features]
+        expected = [
+            *self.smooth_features,
+            *self.linear_features,
+            *self.categorical_features,
+        ]
         missing = sorted(set(expected) - set(X.columns))
         if missing:
             raise ValueError(f"Missing input features: {missing}")
@@ -150,5 +170,7 @@ class GAMFeatureTransformer(BaseEstimator, TransformerMixin):
         smooth = set(self.smooth_features)
         for left, right in self.interaction_pairs:
             if left == right or left not in smooth or right not in smooth:
-                raise ValueError(f"Interactions require distinct smooth features: {left}:{right}")
+                raise ValueError(
+                    f"Interactions require distinct smooth features: {left}:{right}"
+                )
         return X.loc[:, expected].copy()

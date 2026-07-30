@@ -72,7 +72,9 @@ class ExperimentConfig:
             raise ConfigurationError("Inner and outer splits must be at least 2.")
         if self.validation.outer_repeats < 1:
             raise ConfigurationError("outer_repeats must be at least 1.")
-        active = {name for name, spec in self.features.items() if spec.role != "exclude"}
+        active = {
+            name for name, spec in self.features.items() if spec.role != "exclude"
+        }
         if not active:
             raise ConfigurationError("At least one active predictor is required.")
         model_ids = [model.id for model in self.models]
@@ -82,7 +84,9 @@ class ExperimentConfig:
             if model.interactions == "explicit":
                 for left, right in model.pairs:
                     if left not in active or right not in active or left == right:
-                        raise ConfigurationError(f"Invalid interaction pair: {left}:{right}")
+                        raise ConfigurationError(
+                            f"Invalid interaction pair: {left}:{right}"
+                        )
         if any(value < 2 for value in self.search.n_knots):
             raise ConfigurationError("Every n_knots value must be at least 2.")
         if any(value < 1 for value in self.search.degree):
@@ -124,15 +128,41 @@ def load_config(path: Path) -> ExperimentConfig:
         for item in payload["models"]
     )
     validation = ValidationConfig(**payload.get("validation", {}))
-    search_raw = payload.get("search", {})
+
+    search_raw: dict[str, Any] = payload.get(
+        "search",
+        {},
+    )
+
+    search_defaults = SearchConfig()
+
     search = SearchConfig(
-        n_knots=_tuples(search_raw.get("n_knots", SearchConfig.n_knots)),
-        degree=_tuples(search_raw.get("degree", SearchConfig.degree)),
-        C=_tuples(search_raw.get("C", SearchConfig.C)),
+        n_knots=_tuples(
+            search_raw.get(
+                "n_knots",
+                search_defaults.n_knots,
+            )
+        ),
+        degree=_tuples(
+            search_raw.get(
+                "degree",
+                search_defaults.degree,
+            )
+        ),
+        C=_tuples(
+            search_raw.get(
+                "C",
+                search_defaults.C,
+            )
+        ),
         interaction_scale=_tuples(
-            search_raw.get("interaction_scale", SearchConfig.interaction_scale)
+            search_raw.get(
+                "interaction_scale",
+                search_defaults.interaction_scale,
+            )
         ),
     )
+
     execution = ExecutionConfig(**payload.get("execution", {}))
     config = ExperimentConfig(
         schema_version=str(payload.get("schema_version", "1.0")),
@@ -173,7 +203,11 @@ def dump_config_dict(config: ExperimentConfig) -> dict[str, Any]:
             {
                 "id": model.id,
                 "interactions": model.interactions,
-                **({"pairs": [list(pair) for pair in model.pairs]} if model.pairs else {}),
+                **(
+                    {"pairs": [list(pair) for pair in model.pairs]}
+                    if model.pairs
+                    else {}
+                ),
             }
             for model in config.models
         ],

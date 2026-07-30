@@ -20,10 +20,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "mypy>=1.11",
+  "pandas-stubs",
   "pytest>=8",
   "pytest-cov>=5",
   "ruff>=0.6",
-  "mypy>=1.11",
+  "types-PyYAML",
 ]
 
 [project.scripts]
@@ -34,7 +36,10 @@ packages = ["src/gam_app"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = [
+  "-q",
+  "--basetemp=.pytest_tmp",
+]
 
 [tool.ruff]
 line-length = 88
@@ -44,6 +49,14 @@ target-version = "py311"
 select = ["E", "F", "I", "B", "UP"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 warn_unused_configs = true
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+  "joblib",
+  "sklearn",
+  "sklearn.*",
+]
+ignore_missing_imports = true

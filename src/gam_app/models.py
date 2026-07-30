@@ -9,16 +9,24 @@ from .config import ExperimentConfig, ModelConfig
 from .transformers import GAMFeatureTransformer
 
 
-def feature_groups(config: ExperimentConfig) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    smooth = tuple(name for name, spec in config.features.items() if spec.role == "smooth")
-    linear = tuple(name for name, spec in config.features.items() if spec.role == "linear")
+def feature_groups(
+    config: ExperimentConfig,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    smooth = tuple(
+        name for name, spec in config.features.items() if spec.role == "smooth"
+    )
+    linear = tuple(
+        name for name, spec in config.features.items() if spec.role == "linear"
+    )
     categorical = tuple(
         name for name, spec in config.features.items() if spec.role == "categorical"
     )
     return smooth, linear, categorical
 
 
-def interaction_pairs(config: ExperimentConfig, model: ModelConfig) -> tuple[tuple[str, str], ...]:
+def interaction_pairs(
+    config: ExperimentConfig, model: ModelConfig
+) -> tuple[tuple[str, str], ...]:
     smooth, _, _ = feature_groups(config)
     if model.interactions == "none":
         return ()

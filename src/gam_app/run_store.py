@@ -70,7 +70,11 @@ class FileRunStore:
                 raise RuntimeError(f"Run is locked by PID {payload.get('pid')}.")
         write_json_atomic(
             lock,
-            {"pid": os.getpid(), "host": socket.gethostname(), "created_at_utc": utc_now()},
+            {
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "created_at_utc": utc_now(),
+            },
         )
 
     def release_lock(self) -> None:

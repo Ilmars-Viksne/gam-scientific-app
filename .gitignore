@@ -2,12 +2,14 @@
 # OS Specific
 # ==========================================
 data/
-outputs/
-outputs_pairwise/
+configs/
+profile/
+workspace/
 
 # ==========================================
 # Python Bytecode & Cache
 # ==========================================
+.pytest_tmp/
 __pycache__/
 *.py[cod]
 *$py.class

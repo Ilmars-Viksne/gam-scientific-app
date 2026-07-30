@@ -32,12 +32,18 @@ def infer_role(series: pd.Series) -> tuple[str, str]:
         return "categorical", "boolean data"
     if not pd.api.types.is_numeric_dtype(series):
         if ratio > 0.98:
-            return "exclude", "possible text identifier because almost every value is unique"
+            return (
+                "exclude",
+                "possible text identifier because almost every value is unique",
+            )
         return "categorical", "non-numeric data"
     if unique <= 10:
         return "categorical", f"low-cardinality numeric data ({unique} levels)"
     if pd.api.types.is_integer_dtype(series) and ratio > 0.98:
-        return "exclude", "possible integer identifier because almost every value is unique"
+        return (
+            "exclude",
+            "possible integer identifier because almost every value is unique",
+        )
     return "smooth", f"numeric data with {unique} unique values"
 
 
@@ -48,7 +54,9 @@ def profile_data(path: Path, target: str) -> dict[str, Any]:
     columns: dict[str, Any] = {}
     for name in frame.columns:
         series = frame[name]
-        role, reason = ("target", "selected target") if name == target else infer_role(series)
+        role, reason = (
+            ("target", "selected target") if name == target else infer_role(series)
+        )
         info: dict[str, Any] = {
             "dtype": str(series.dtype),
             "missing": int(series.isna().sum()),
@@ -63,7 +71,8 @@ def profile_data(path: Path, target: str) -> dict[str, Any]:
             info["maximum"] = float(clean.max())
         else:
             info["top_values"] = {
-                str(key): int(value) for key, value in series.value_counts(dropna=False).head(10).items()
+                str(key): int(value)
+                for key, value in series.value_counts(dropna=False).head(10).items()
             }
         columns[name] = info
     return {
@@ -73,14 +82,17 @@ def profile_data(path: Path, target: str) -> dict[str, Any]:
         "columns": int(frame.shape[1]),
         "target": target,
         "target_counts": {
-            str(key): int(value) for key, value in frame[target].value_counts(dropna=False).items()
+            str(key): int(value)
+            for key, value in frame[target].value_counts(dropna=False).items()
         },
         "duplicate_rows": int(frame.duplicated().sum()),
         "column_profiles": columns,
     }
 
 
-def validate_training_data(config: ExperimentConfig) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+def validate_training_data(
+    config: ExperimentConfig,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     frame = load_table(config.data_path)
     required = [config.target, *config.features]
     missing_columns = sorted(set(required) - set(frame.columns))
@@ -92,7 +104,34 @@ def validate_training_data(config: ExperimentConfig) -> tuple[pd.DataFrame, pd.S
     if target.isna().any():
         raise DataValidationError("Missing target values are not supported.")
     if target.nunique() < 2:
-        raise DataValidationError("Classification requires at least two target classes.")
+        class_counts = target.astype(str).value_counts()
+        smallest_class_count = int(class_counts.min())
+
+        outer_splits = config.validation.outer_splits
+        inner_splits = config.validation.inner_splits
+
+        if smallest_class_count < outer_splits:
+            raise DataValidationError(
+                "The least frequent target class contains "
+                f"{smallest_class_count} observations, but "
+                f"outer_splits={outer_splits}."
+            )
+
+        largest_outer_test_count = int(np.ceil(smallest_class_count / outer_splits))
+
+        smallest_outer_train_count = smallest_class_count - largest_outer_test_count
+
+        if smallest_outer_train_count < inner_splits:
+            raise DataValidationError(
+                "The least frequent target class may contain only "
+                f"{smallest_outer_train_count} observations in an outer "
+                f"training partition, but inner_splits={inner_splits}."
+            )
+
+        raise DataValidationError(
+            "Classification requires at least two target classes."
+        )
+
     active = [name for name, spec in config.features.items() if spec.role != "exclude"]
     X = frame.loc[:, active].copy()
     for name in active:
@@ -116,8 +155,15 @@ def validate_training_data(config: ExperimentConfig) -> tuple[pd.DataFrame, pd.S
 
 def save_profile(profile: dict[str, Any], directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "profile.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    (directory / "profile.json").write_text(
+        json.dumps(profile, indent=2), encoding="utf-8"
+    )
     rows = []
     for name, info in profile["column_profiles"].items():
-        rows.append({"column": name, **{k: v for k, v in info.items() if not isinstance(v, dict)}})
+        rows.append(
+            {
+                "column": name,
+                **{k: v for k, v in info.items() if not isinstance(v, dict)},
+            }
+        )
     pd.DataFrame(rows).to_csv(directory / "columns.csv", index=False)
