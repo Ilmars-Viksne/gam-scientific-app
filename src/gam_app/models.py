@@ -44,22 +44,69 @@ def build_pipeline(
     C: float,
     interaction_scale: float,
 ) -> Pipeline:
-    smooth, linear, categorical = feature_groups(config)
-    policies = tuple((name, spec.missing) for name, spec in config.features.items())
+    smooth_features = tuple(
+        feature_name
+        for feature_name, feature_config in config.features.items()
+        if feature_config.role == "smooth"
+    )
+
+    linear_features = tuple(
+        feature_name
+        for feature_name, feature_config in config.features.items()
+        if feature_config.role == "linear"
+    )
+
+    categorical_features = tuple(
+        feature_name
+        for feature_name, feature_config in config.features.items()
+        if feature_config.role == "categorical"
+    )
+
+    categorical_levels = tuple(
+        tuple(str(category) for category in config.features[feature_name].categories)
+        for feature_name in categorical_features
+    )
+
+    missing_policies = tuple(
+        (
+            feature_name,
+            feature_config.missing,
+        )
+        for feature_name, feature_config in config.features.items()
+        if feature_config.role != "exclude"
+    )
+
+    pairs = interaction_pairs(
+        config,
+        model,
+    )
+
     transformer = GAMFeatureTransformer(
-        smooth_features=smooth,
-        linear_features=linear,
-        categorical_features=categorical,
-        interaction_pairs=interaction_pairs(config, model),
-        missing_policies=policies,
+        smooth_features=smooth_features,
+        linear_features=linear_features,
+        categorical_features=categorical_features,
+        categorical_levels=categorical_levels,
+        interaction_pairs=pairs,
+        missing_policies=missing_policies,
         n_knots=n_knots,
         degree=degree,
         interaction_scale=interaction_scale,
     )
+
     classifier = LogisticRegression(
-        solver="lbfgs",
         C=C,
-        max_iter=20_000,
-        random_state=config.validation.random_state,
+        max_iter=5000,
     )
-    return Pipeline([("features", transformer), ("classifier", classifier)])
+
+    return Pipeline(
+        steps=[
+            (
+                "features",
+                transformer,
+            ),
+            (
+                "classifier",
+                classifier,
+            ),
+        ]
+    )

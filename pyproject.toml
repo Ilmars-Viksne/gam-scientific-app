@@ -36,6 +36,9 @@ packages = ["src/gam_app"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+  "ignore:Setting the shape on a NumPy array has been deprecated in NumPy 2\\.5\\.:DeprecationWarning:joblib\\.numpy_pickle",
+]
 addopts = [
   "-q",
   "--basetemp=.pytest_tmp",
