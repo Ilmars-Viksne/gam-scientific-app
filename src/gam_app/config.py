@@ -72,6 +72,8 @@ class ExperimentConfig:
             raise ConfigurationError("Inner and outer splits must be at least 2.")
         if self.validation.outer_repeats < 1:
             raise ConfigurationError("outer_repeats must be at least 1.")
+        if self.execution.workers < 1:
+            raise ConfigurationError("execution.workers must be at least 1.")
         active = {
             name for name, spec in self.features.items() if spec.role != "exclude"
         }

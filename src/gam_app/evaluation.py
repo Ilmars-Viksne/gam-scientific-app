@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import itertools
 import json
+import shutil
 import warnings
+from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import joblib
@@ -17,6 +22,30 @@ from .io_utils import utc_now, write_json_atomic
 from .logistic import extract_class_score_parameters
 from .models import build_pipeline
 from .run_store import FileRunStore
+
+
+@dataclass(frozen=True, slots=True)
+class OuterFoldTask:
+    model: ModelConfig
+    repeat: int
+    fold: int
+    train_indices: tuple[int, ...]
+    test_indices: tuple[int, ...]
+    seed: int
+
+
+@dataclass(frozen=True, slots=True)
+class OuterFoldResult:
+    model_id: str
+    repeat: int
+    fold: int
+    metrics: dict[str, Any]
+    trials: pd.DataFrame
+    predictions: pd.DataFrame
+    fitted_model: Any
+
+
+OuterFoldCallback = Callable[[OuterFoldResult], None]
 
 
 def parameter_candidates(config: ExperimentConfig, model: ModelConfig):
@@ -85,6 +114,38 @@ def _fold_metrics(y_true, predictions, probabilities, classes) -> dict[str, floa
     }
 
 
+def build_outer_fold_tasks(
+    config: ExperimentConfig,
+    model: ModelConfig,
+    splits: pd.DataFrame,
+) -> list[OuterFoldTask]:
+    tasks: list[OuterFoldTask] = []
+    group_keys = (
+        splits[["repeat", "fold"]].drop_duplicates().itertuples(index=False, name=None)
+    )
+    for iteration, (repeat, fold) in enumerate(group_keys, start=1):
+        subset = splits[(splits.repeat == repeat) & (splits.fold == fold)]
+        train = tuple(
+            int(value)
+            for value in subset.loc[subset.partition == "train", "row_index"].to_numpy()
+        )
+        test = tuple(
+            int(value)
+            for value in subset.loc[subset.partition == "test", "row_index"].to_numpy()
+        )
+        tasks.append(
+            OuterFoldTask(
+                model=model,
+                repeat=int(repeat),
+                fold=int(fold),
+                train_indices=train,
+                test_indices=test,
+                seed=config.validation.random_state + iteration,
+            )
+        )
+    return tasks
+
+
 def create_split_manifest(config: ExperimentConfig, X, y, row_ids) -> pd.DataFrame:
     splitter = RepeatedStratifiedKFold(
         n_splits=config.validation.outer_splits,
@@ -118,6 +179,199 @@ def create_split_manifest(config: ExperimentConfig, X, y, row_ids) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
+def execute_outer_fold_task(
+    task: OuterFoldTask,
+    config: ExperimentConfig,
+    X: pd.DataFrame,
+    y: pd.Series,
+    row_ids: pd.Series,
+) -> OuterFoldResult:
+    train = np.asarray(task.train_indices, dtype=int)
+    test = np.asarray(task.test_indices, dtype=int)
+
+    best, trials = inner_search(
+        config,
+        task.model,
+        X.iloc[train],
+        y.iloc[train],
+        task.seed,
+    )
+    pipeline = build_pipeline(
+        config,
+        task.model,
+        n_knots=int(best["n_knots"]),
+        degree=int(best["degree"]),
+        C=float(best["C"]),
+        interaction_scale=float(best["interaction_scale"]),
+    )
+    pipeline.fit(X.iloc[train], y.iloc[train])
+    probabilities = pipeline.predict_proba(X.iloc[test])
+    predictions = pipeline.predict(X.iloc[test])
+    classes = pipeline.named_steps["classifier"].classes_
+    metrics = {
+        "model_id": task.model.id,
+        "repeat": task.repeat,
+        "fold": task.fold,
+        **_fold_metrics(y.iloc[test], predictions, probabilities, classes),
+        **{f"best_{key}": value for key, value in best.items()},
+    }
+    prediction_frame = pd.DataFrame(
+        {
+            "model_id": task.model.id,
+            "repeat": task.repeat,
+            "fold": task.fold,
+            "row_id": row_ids.iloc[test].to_numpy(),
+            "observed_class": y.iloc[test].to_numpy(),
+            "predicted_class": predictions,
+        }
+    )
+    for index, class_name in enumerate(classes):
+        prediction_frame[f"probability_{class_name}"] = probabilities[:, index]
+
+    return OuterFoldResult(
+        model_id=task.model.id,
+        repeat=task.repeat,
+        fold=task.fold,
+        metrics=metrics,
+        trials=trials,
+        predictions=prediction_frame,
+        fitted_model=pipeline,
+    )
+
+
+def run_outer_folds_sequentially(
+    tasks: Iterable[OuterFoldTask],
+    config: ExperimentConfig,
+    X: pd.DataFrame,
+    y: pd.Series,
+    row_ids: pd.Series,
+    on_started: Callable[[OuterFoldTask], None],
+    on_completed: OuterFoldCallback,
+) -> None:
+    for task in tasks:
+        on_started(task)
+        result = execute_outer_fold_task(task, config, X, y, row_ids)
+        on_completed(result)
+
+
+def run_outer_folds_in_parallel(
+    tasks: Iterable[OuterFoldTask],
+    config: ExperimentConfig,
+    X: pd.DataFrame,
+    y: pd.Series,
+    row_ids: pd.Series,
+    workers: int,
+    on_started: Callable[[OuterFoldTask], None],
+    on_completed: OuterFoldCallback,
+    should_stop: Callable[[], bool],
+) -> None:
+    task_list = list(tasks)
+    if not task_list:
+        return
+
+    maximum_workers = min(workers, len(task_list))
+    future_tasks: dict[Future[OuterFoldResult], OuterFoldTask] = {}
+
+    with ProcessPoolExecutor(max_workers=maximum_workers) as executor:
+        for task in task_list:
+            if should_stop():
+                break
+            on_started(task)
+            future = executor.submit(
+                execute_outer_fold_task, task, config, X, y, row_ids
+            )
+            future_tasks[future] = task
+
+        pending = set(future_tasks)
+        while pending:
+            if should_stop():
+                for future in pending:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+                return
+
+            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            for future in done:
+                task = future_tasks[future]
+                try:
+                    result = future.result()
+                except BaseException as error:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    raise RuntimeError(
+                        "Outer-fold worker failed for "
+                        f"model={task.model.id!r}, repeat={task.repeat}, "
+                        f"fold={task.fold}."
+                    ) from error
+                on_completed(result)
+
+
+def write_fold_checkpoint(
+    result: OuterFoldResult,
+    checkpoint: Path,
+    data_hash: str,
+    config_hash: str,
+) -> None:
+    temporary = checkpoint.with_name(checkpoint.name + ".tmp")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        temporary / "checkpoint.json",
+        {
+            "model_id": result.model_id,
+            "repeat": result.repeat,
+            "fold": result.fold,
+            "data_hash": data_hash,
+            "config_hash": config_hash,
+            "completed_at_utc": utc_now(),
+        },
+    )
+    write_json_atomic(temporary / "metrics.json", result.metrics)
+    result.trials.to_parquet(temporary / "trials.parquet", index=False)
+    result.predictions.to_parquet(temporary / "predictions.parquet", index=False)
+    joblib.dump(result.fitted_model, temporary / "model.joblib")
+    (temporary / "COMPLETE").touch()
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    if checkpoint.exists():
+        shutil.rmtree(checkpoint)
+    temporary.replace(checkpoint)
+
+
+def rebuild_model_results(
+    tasks: list[OuterFoldTask],
+    store: FileRunStore,
+    data_hash: str,
+    config_hash: str,
+) -> None:
+    fold_rows = []
+    prediction_frames = []
+    for task in sorted(tasks, key=lambda item: (item.repeat, item.fold)):
+        if not store.checkpoint_complete(
+            task.model.id, task.repeat, task.fold, data_hash, config_hash
+        ):
+            raise RuntimeError(
+                "Cannot build aggregate results because an outer fold is incomplete: "
+                f"model={task.model.id!r}, repeat={task.repeat}, fold={task.fold}."
+            )
+        checkpoint = store.checkpoint_directory(task.model.id, task.repeat, task.fold)
+        fold_rows.append(
+            json.loads((checkpoint / "metrics.json").read_text(encoding="utf-8"))
+        )
+        prediction_frames.append(pd.read_parquet(checkpoint / "predictions.parquet"))
+
+    fold_frame = pd.DataFrame(fold_rows)
+    predictions = pd.concat(prediction_frames, ignore_index=True)
+    model_results = store.results / tasks[0].model.id
+    model_results.mkdir(parents=True, exist_ok=True)
+    fold_frame.to_csv(model_results / "fold_metrics.csv", index=False)
+    predictions.to_parquet(model_results / "predictions.parquet", index=False)
+    metric_columns = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
+    fold_frame[metric_columns].agg(["mean", "std", "median", "min", "max"]).T.to_csv(
+        model_results / "summary.csv"
+    )
+
+
 def run_model(
     config: ExperimentConfig,
     model: ModelConfig,
@@ -129,122 +383,99 @@ def run_model(
     data_hash: str,
     config_hash: str,
 ) -> None:
-    fold_rows = []
-    prediction_frames = []
-    group_keys = (
-        splits[["repeat", "fold"]].drop_duplicates().itertuples(index=False, name=None)
-    )
+    all_tasks = build_outer_fold_tasks(config, model, splits)
     total = config.validation.outer_splits * config.validation.outer_repeats
-    for iteration, (repeat, fold) in enumerate(group_keys, start=1):
+    pending_tasks = []
+    for task in all_tasks:
         if store.requested("CANCEL"):
             store.update_status(state="cancelled")
             return
         if store.requested("PAUSE"):
             store.update_status(state="paused")
             return
-        checkpoint = store.checkpoint_directory(model.id, repeat, fold)
-        if store.checkpoint_complete(model.id, repeat, fold, data_hash, config_hash):
-            fold_rows.append(
-                json.loads((checkpoint / "metrics.json").read_text(encoding="utf-8"))
-            )
-            prediction_frames.append(
-                pd.read_parquet(checkpoint / "predictions.parquet")
-            )
+        if store.checkpoint_complete(
+            model.id, task.repeat, task.fold, data_hash, config_hash
+        ):
             continue
-        subset = splits[(splits.repeat == repeat) & (splits.fold == fold)]
-        train = subset.loc[subset.partition == "train", "row_index"].to_numpy()
-        test = subset.loc[subset.partition == "test", "row_index"].to_numpy()
+        pending_tasks.append(task)
+
+    completed_outer_folds = len(all_tasks) - len(pending_tasks)
+
+    def should_stop() -> bool:
+        if store.requested("CANCEL"):
+            store.update_status(state="cancelled")
+            return True
+        if store.requested("PAUSE"):
+            store.update_status(state="paused")
+            return True
+        return False
+
+    def on_started(task: OuterFoldTask) -> None:
         store.update_status(
             state="running",
             phase="nested_cross_validation",
             model_id=model.id,
-            repeat=int(repeat),
-            fold=int(fold),
-            completed_outer_folds=iteration - 1,
+            repeat=task.repeat,
+            fold=task.fold,
+            completed_outer_folds=completed_outer_folds,
             total_outer_folds=total,
         )
-        store.event("fold_started", model_id=model.id, repeat=repeat, fold=fold)
-        best, trials = inner_search(
-            config,
-            model,
-            X.iloc[train],
-            y.iloc[train],
-            config.validation.random_state + iteration,
+        store.event(
+            "fold_started", model_id=model.id, repeat=task.repeat, fold=task.fold
         )
-        pipeline = build_pipeline(
-            config,
-            model,
-            n_knots=int(best["n_knots"]),
-            degree=int(best["degree"]),
-            C=float(best["C"]),
-            interaction_scale=float(best["interaction_scale"]),
-        )
-        pipeline.fit(X.iloc[train], y.iloc[train])
-        probabilities = pipeline.predict_proba(X.iloc[test])
-        predictions = pipeline.predict(X.iloc[test])
-        classes = pipeline.named_steps["classifier"].classes_
-        metrics = {
-            "model_id": model.id,
-            "repeat": int(repeat),
-            "fold": int(fold),
-            **_fold_metrics(y.iloc[test], predictions, probabilities, classes),
-            **{f"best_{key}": value for key, value in best.items()},
-        }
-        prediction_frame = pd.DataFrame(
-            {
-                "model_id": model.id,
-                "repeat": repeat,
-                "fold": fold,
-                "row_id": row_ids.iloc[test].to_numpy(),
-                "observed_class": y.iloc[test].to_numpy(),
-                "predicted_class": predictions,
-            }
-        )
-        for index, class_name in enumerate(classes):
-            prediction_frame[f"probability_{class_name}"] = probabilities[:, index]
-        temporary = checkpoint.with_name(checkpoint.name + ".tmp")
-        if temporary.exists():
-            import shutil
 
-            shutil.rmtree(temporary)
-        temporary.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(
-            temporary / "checkpoint.json",
-            {
-                "model_id": model.id,
-                "repeat": repeat,
-                "fold": fold,
-                "data_hash": data_hash,
-                "config_hash": config_hash,
-                "completed_at_utc": utc_now(),
-            },
+    def on_completed(result: OuterFoldResult) -> None:
+        nonlocal completed_outer_folds
+
+        checkpoint = store.checkpoint_directory(
+            result.model_id, result.repeat, result.fold
         )
-        write_json_atomic(temporary / "metrics.json", metrics)
-        trials.to_parquet(temporary / "trials.parquet", index=False)
-        prediction_frame.to_parquet(temporary / "predictions.parquet", index=False)
-        joblib.dump(pipeline, temporary / "model.joblib")
-        (temporary / "COMPLETE").touch()
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        temporary.replace(checkpoint)
-        fold_rows.append(metrics)
-        prediction_frames.append(prediction_frame)
+        write_fold_checkpoint(result, checkpoint, data_hash, config_hash)
+        completed_outer_folds += 1
+        store.update_status(
+            state="running",
+            phase="nested_cross_validation",
+            model_id=result.model_id,
+            repeat=result.repeat,
+            fold=result.fold,
+            completed_outer_folds=completed_outer_folds,
+            total_outer_folds=total,
+        )
         store.event(
             "fold_completed",
-            model_id=model.id,
-            repeat=repeat,
-            fold=fold,
-            log_loss=metrics["log_loss"],
+            model_id=result.model_id,
+            repeat=result.repeat,
+            fold=result.fold,
+            log_loss=result.metrics["log_loss"],
         )
-    fold_frame = pd.DataFrame(fold_rows)
-    predictions = pd.concat(prediction_frames, ignore_index=True)
-    model_results = store.results / model.id
-    model_results.mkdir(parents=True, exist_ok=True)
-    fold_frame.to_csv(model_results / "fold_metrics.csv", index=False)
-    predictions.to_parquet(model_results / "predictions.parquet", index=False)
-    metric_columns = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
-    fold_frame[metric_columns].agg(["mean", "std", "median", "min", "max"]).T.to_csv(
-        model_results / "summary.csv"
-    )
+
+    if config.execution.workers == 1:
+        run_outer_folds_sequentially(
+            pending_tasks,
+            config,
+            X,
+            y,
+            row_ids,
+            on_started,
+            on_completed,
+        )
+    else:
+        run_outer_folds_in_parallel(
+            pending_tasks,
+            config,
+            X,
+            y,
+            row_ids,
+            config.execution.workers,
+            on_started,
+            on_completed,
+            should_stop,
+        )
+
+    if should_stop():
+        return
+
+    rebuild_model_results(all_tasks, store, data_hash, config_hash)
 
 
 def fit_final_model(config, model, X, y, store):
