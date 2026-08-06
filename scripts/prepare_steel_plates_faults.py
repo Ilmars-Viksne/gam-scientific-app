@@ -89,14 +89,42 @@ def validate_targets(frame: pd.DataFrame) -> None:
         )
 
 
-def prepare_data(frame: pd.DataFrame) -> pd.DataFrame:
+def prepare_data(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create one target column and one steel-type column."""
+
     validate_targets(frame)
 
-    target_matrix = frame[TARGET_COLUMNS]
+    steel_indicator_sum = frame["TypeOfSteel_A300"] + frame["TypeOfSteel_A400"]
+
+    valid_steel_indicator = steel_indicator_sum.eq(1)
+
+    if not valid_steel_indicator.all():
+        invalid_rows = frame.index[~valid_steel_indicator].tolist()
+
+        raise ValueError(
+            "Steel-type indicators must contain exactly one "
+            "active value per row. "
+            f"Invalid rows include: {invalid_rows[:10]}."
+        )
 
     prepared = frame[FEATURE_COLUMNS].copy()
 
-    prepared["Y"] = target_matrix.idxmax(axis=1).astype("string")
+    prepared["Steel_Type"] = np.where(
+        frame["TypeOfSteel_A300"].eq(1),
+        "A300",
+        "A400",
+    )
+
+    prepared = prepared.drop(
+        columns=[
+            "TypeOfSteel_A300",
+            "TypeOfSteel_A400",
+        ]
+    )
+
+    prepared["Y"] = frame[TARGET_COLUMNS].idxmax(axis=1).astype("string")
 
     return prepared
 
@@ -104,17 +132,27 @@ def prepare_data(frame: pd.DataFrame) -> pd.DataFrame:
 def validate_prepared_data(
     frame: pd.DataFrame,
 ) -> None:
+    """Validate the prepared classification dataset."""
+
     if frame.empty:
         raise ValueError("The prepared dataset is empty.")
 
     if frame.columns.has_duplicates:
-        raise ValueError("The prepared dataset has duplicate column names.")
+        duplicate_columns = (
+            frame.columns[frame.columns.duplicated()].astype(str).tolist()
+        )
 
-    if frame.isna().any().any():
-        missing = frame.isna().sum()
-        missing = missing[missing > 0].to_dict()
+        raise ValueError(
+            f"The prepared dataset has duplicate column names: {duplicate_columns}."
+        )
 
-        raise ValueError(f"Prepared data contains missing values: {missing}.")
+    missing_counts = frame.isna().sum()
+    missing_counts = missing_counts[missing_counts > 0]
+
+    if not missing_counts.empty:
+        raise ValueError(
+            f"Prepared data contains missing values: {missing_counts.to_dict()}."
+        )
 
     expected_classes = set(TARGET_COLUMNS)
     observed_classes = set(frame["Y"].astype(str).unique())
@@ -127,12 +165,54 @@ def validate_prepared_data(
             f"received {sorted(observed_classes)}."
         )
 
-    numeric_columns = frame.columns.drop("Y")
+    expected_steel_types = {
+        "A300",
+        "A400",
+    }
 
-    numeric_values = frame[numeric_columns].to_numpy(dtype=np.float64)
+    observed_steel_types = set(frame["Steel_Type"].astype(str).unique())
+
+    if observed_steel_types != expected_steel_types:
+        raise ValueError(
+            "Prepared steel types do not match the expected "
+            "categories. "
+            f"Expected {sorted(expected_steel_types)}, "
+            f"received {sorted(observed_steel_types)}."
+        )
+
+    categorical_columns = {
+        "Steel_Type",
+        "Y",
+    }
+
+    numeric_columns = [
+        column for column in frame.columns if column not in categorical_columns
+    ]
+
+    numeric_frame = frame.loc[
+        :,
+        numeric_columns,
+    ].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    invalid_numeric_counts = numeric_frame.isna().sum()
+    invalid_numeric_counts = invalid_numeric_counts[invalid_numeric_counts > 0]
+
+    if not invalid_numeric_counts.empty:
+        raise ValueError(
+            "Prepared numeric predictors contain non-numeric "
+            "values: "
+            f"{invalid_numeric_counts.to_dict()}."
+        )
+
+    numeric_values = numeric_frame.to_numpy(
+        dtype=np.float64,
+    )
 
     if not np.isfinite(numeric_values).all():
-        raise ValueError("Prepared predictors contain nonfinite values.")
+        raise ValueError("Prepared numeric predictors contain nonfinite values.")
 
 
 def main() -> None:
@@ -160,7 +240,10 @@ def main() -> None:
 
     print(f"Source rows: {len(frame)}")
     print(f"Prepared rows: {len(prepared)}")
-    print(f"Predictors: {len(FEATURE_COLUMNS)}")
+
+    predictor_count = len(prepared.columns.drop("Y"))
+    print(f"Predictors: {predictor_count}")
+
     print()
     print("Target counts:")
     print(prepared["Y"].value_counts().sort_index().to_string())
