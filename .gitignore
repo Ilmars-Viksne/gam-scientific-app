@@ -5,6 +5,7 @@ data/
 configs/
 profile/
 workspace/
+comparisons/
 
 # ==========================================
 # Python Bytecode & Cache
