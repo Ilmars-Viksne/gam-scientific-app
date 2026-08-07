@@ -118,31 +118,192 @@ def build_outer_fold_tasks(
     config: ExperimentConfig,
     model: ModelConfig,
     splits: pd.DataFrame,
+    row_count: int,
 ) -> list[OuterFoldTask]:
-    tasks: list[OuterFoldTask] = []
-    group_keys = (
-        splits[["repeat", "fold"]].drop_duplicates().itertuples(index=False, name=None)
+
+    if row_count < 1:
+        raise ValueError("row_count must be at least 1.")
+
+    required_columns = {
+        "repeat",
+        "fold",
+        "row_index",
+        "partition",
+    }
+
+    missing_columns = sorted(required_columns - set(splits.columns))
+
+    if missing_columns:
+        raise ValueError(
+            f"The split manifest is missing required columns: {missing_columns}."
+        )
+
+    if splits.empty:
+        raise ValueError("The split manifest is empty.")
+
+    valid_partitions = {
+        "train",
+        "test",
+    }
+
+    observed_partitions = set(splits["partition"].dropna().astype(str).unique())
+
+    invalid_partitions = sorted(observed_partitions - valid_partitions)
+
+    if invalid_partitions:
+        raise ValueError(
+            "The split manifest contains invalid partition values: "
+            f"{invalid_partitions}."
+        )
+
+    if splits["partition"].isna().any():
+        raise ValueError("The split manifest contains missing partition values.")
+
+    if splits["row_index"].isna().any():
+        raise ValueError("The split manifest contains missing row indices.")
+
+    expected_indices = set(range(row_count))
+
+    group_frame = (
+        splits[
+            [
+                "repeat",
+                "fold",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            [
+                "repeat",
+                "fold",
+            ]
+        )
     )
-    for iteration, (repeat, fold) in enumerate(group_keys, start=1):
-        subset = splits[(splits.repeat == repeat) & (splits.fold == fold)]
-        train = tuple(
-            int(value)
-            for value in subset.loc[subset.partition == "train", "row_index"].to_numpy()
+
+    expected_task_count = (
+        config.validation.outer_splits * config.validation.outer_repeats
+    )
+
+    if len(group_frame) != expected_task_count:
+        raise ValueError(
+            "The split manifest has an unexpected number of "
+            "outer folds. "
+            f"Expected {expected_task_count}, "
+            f"received {len(group_frame)}."
         )
-        test = tuple(
-            int(value)
-            for value in subset.loc[subset.partition == "test", "row_index"].to_numpy()
+
+    tasks: list[OuterFoldTask] = []
+
+    for repeat_value, fold_value in group_frame.itertuples(
+        index=False,
+        name=None,
+    ):
+        repeat = int(repeat_value)
+        fold = int(fold_value)
+
+        if not (1 <= repeat <= config.validation.outer_repeats):
+            raise ValueError(
+                f"The split manifest contains an invalid repeat number: {repeat}."
+            )
+
+        if not (1 <= fold <= config.validation.outer_splits):
+            raise ValueError(
+                f"The split manifest contains an invalid fold number: {fold}."
+            )
+
+        subset = splits.loc[(splits["repeat"] == repeat) & (splits["fold"] == fold)]
+
+        train_values = subset.loc[
+            subset["partition"] == "train",
+            "row_index",
+        ]
+
+        test_values = subset.loc[
+            subset["partition"] == "test",
+            "row_index",
+        ]
+
+        train_indices = tuple(int(value) for value in train_values.to_numpy())
+
+        test_indices = tuple(int(value) for value in test_values.to_numpy())
+
+        if not train_indices:
+            raise ValueError(
+                "The outer training partition is empty for "
+                f"repeat={repeat}, fold={fold}."
+            )
+
+        if not test_indices:
+            raise ValueError(
+                f"The outer test partition is empty for repeat={repeat}, fold={fold}."
+            )
+
+        if len(train_indices) != len(set(train_indices)):
+            raise ValueError(
+                "The outer training partition contains duplicate "
+                "row indices for "
+                f"repeat={repeat}, fold={fold}."
+            )
+
+        if len(test_indices) != len(set(test_indices)):
+            raise ValueError(
+                "The outer test partition contains duplicate row "
+                "indices for "
+                f"repeat={repeat}, fold={fold}."
+            )
+
+        train_set = set(train_indices)
+        test_set = set(test_indices)
+
+        overlapping_indices = sorted(train_set & test_set)
+
+        if overlapping_indices:
+            raise ValueError(
+                "Outer training and test partitions overlap for "
+                f"repeat={repeat}, fold={fold}. "
+                "Overlapping row indices include: "
+                f"{overlapping_indices[:10]}."
+            )
+
+        observed_indices = train_set | test_set
+
+        missing_indices = sorted(expected_indices - observed_indices)
+
+        unexpected_indices = sorted(observed_indices - expected_indices)
+
+        if missing_indices:
+            raise ValueError(
+                "The outer fold does not cover every dataset row "
+                f"for repeat={repeat}, fold={fold}. "
+                "Missing row indices include: "
+                f"{missing_indices[:10]}."
+            )
+
+        if unexpected_indices:
+            raise ValueError(
+                "The outer fold contains row indices outside the "
+                f"dataset for repeat={repeat}, fold={fold}. "
+                "Unexpected row indices include: "
+                f"{unexpected_indices[:10]}."
+            )
+
+        seed = (
+            config.validation.random_state
+            + (repeat - 1) * config.validation.outer_splits
+            + fold
         )
+
         tasks.append(
             OuterFoldTask(
                 model=model,
-                repeat=int(repeat),
-                fold=int(fold),
-                train_indices=train,
-                test_indices=test,
-                seed=config.validation.random_state + iteration,
+                repeat=repeat,
+                fold=fold,
+                train_indices=train_indices,
+                test_indices=test_indices,
+                seed=seed,
             )
         )
+
     return tasks
 
 
@@ -265,45 +426,77 @@ def run_outer_folds_in_parallel(
     on_completed: OuterFoldCallback,
     should_stop: Callable[[], bool],
 ) -> None:
-    task_list = list(tasks)
-    if not task_list:
-        return
+    task_iterator = iter(tasks)
+    maximum_workers = workers
 
-    maximum_workers = min(workers, len(task_list))
-    future_tasks: dict[Future[OuterFoldResult], OuterFoldTask] = {}
+    future_tasks: dict[
+        Future[OuterFoldResult],
+        OuterFoldTask,
+    ] = {}
 
-    with ProcessPoolExecutor(max_workers=maximum_workers) as executor:
-        for task in task_list:
-            if should_stop():
+    def submit_next(
+        executor: ProcessPoolExecutor,
+    ) -> bool:
+        if should_stop():
+            return False
+
+        try:
+            task = next(task_iterator)
+        except StopIteration:
+            return False
+
+        on_started(task)
+
+        future = executor.submit(
+            execute_outer_fold_task,
+            task,
+            config,
+            X,
+            y,
+            row_ids,
+        )
+
+        future_tasks[future] = task
+        return True
+
+    with ProcessPoolExecutor(
+        max_workers=maximum_workers,
+    ) as executor:
+        for _ in range(maximum_workers):
+            if not submit_next(executor):
                 break
-            on_started(task)
-            future = executor.submit(
-                execute_outer_fold_task, task, config, X, y, row_ids
-            )
-            future_tasks[future] = task
 
-        pending = set(future_tasks)
-        while pending:
+        while future_tasks:
             if should_stop():
-                for future in pending:
+                for future in future_tasks:
                     future.cancel()
-                executor.shutdown(wait=True, cancel_futures=True)
+
                 return
 
-            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            done, _ = wait(
+                future_tasks,
+                timeout=1.0,
+                return_when=FIRST_COMPLETED,
+            )
+
             for future in done:
-                task = future_tasks[future]
+                task = future_tasks.pop(future)
+
                 try:
                     result = future.result()
                 except BaseException as error:
-                    for pending_future in pending:
+                    for pending_future in future_tasks:
                         pending_future.cancel()
+
                     raise RuntimeError(
                         "Outer-fold worker failed for "
-                        f"model={task.model.id!r}, repeat={task.repeat}, "
+                        f"model={task.model.id!r}, "
+                        f"repeat={task.repeat}, "
                         f"fold={task.fold}."
                     ) from error
+
                 on_completed(result)
+                submit_next(executor)
 
 
 def write_fold_checkpoint(
@@ -383,7 +576,14 @@ def run_model(
     data_hash: str,
     config_hash: str,
 ) -> None:
-    all_tasks = build_outer_fold_tasks(config, model, splits)
+
+    all_tasks = build_outer_fold_tasks(
+        config=config,
+        model=model,
+        splits=splits,
+        row_count=len(X),
+    )
+
     total = config.validation.outer_splits * config.validation.outer_repeats
     pending_tasks = []
     for task in all_tasks:
@@ -478,8 +678,43 @@ def run_model(
     rebuild_model_results(all_tasks, store, data_hash, config_hash)
 
 
-def fit_final_model(config, model, X, y, store):
-    best, trials = inner_search(config, model, X, y, config.validation.random_state)
+def fit_final_model(
+    config: ExperimentConfig,
+    model: ModelConfig,
+    X: pd.DataFrame,
+    y: pd.Series,
+    store: FileRunStore,
+) -> None:
+    """Tune and fit the final model using the complete dataset."""
+
+    if len(X) != len(y):
+        raise ValueError(
+            "Predictor and target row counts do not match: "
+            f"X has {len(X)} rows and y has {len(y)} rows."
+        )
+
+    if X.empty:
+        raise ValueError("Cannot fit the final model on an empty dataset.")
+
+    if y.isna().any():
+        raise ValueError("The final-model target contains missing values.")
+
+    expected_classes = np.asarray(
+        sorted(str(value) for value in y.unique()),
+        dtype=object,
+    )
+
+    if len(expected_classes) < 2:
+        raise ValueError("Final classification requires at least two target classes.")
+
+    best, trials = inner_search(
+        config=config,
+        model=model,
+        X=X,
+        y=y,
+        seed=config.validation.random_state,
+    )
+
     pipeline = build_pipeline(
         config,
         model,
@@ -488,28 +723,82 @@ def fit_final_model(config, model, X, y, store):
         C=float(best["C"]),
         interaction_scale=float(best["interaction_scale"]),
     )
-    pipeline.fit(X, y)
-    directory = store.models / model.id
-    directory.mkdir(parents=True, exist_ok=True)
-    joblib.dump(pipeline, directory / "model.joblib")
-    write_json_atomic(directory / "best_parameters.json", best)
-    trials.to_parquet(directory / "search_trials.parquet", index=False)
+
+    with warnings.catch_warnings():
+        if config.execution.stop_on_convergence_warning:
+            warnings.filterwarnings(
+                "error",
+                category=ConvergenceWarning,
+            )
+
+        pipeline.fit(X, y)
 
     transformer = pipeline.named_steps["features"]
     classifier = pipeline.named_steps["classifier"]
 
-    feature_names = transformer.get_feature_names_out()
+    actual_classes = np.asarray(
+        [str(value) for value in classifier.classes_],
+        dtype=object,
+    )
+
+    if not np.array_equal(
+        actual_classes,
+        expected_classes,
+    ):
+        raise RuntimeError(
+            "The final classifier classes do not match the "
+            "complete training target. "
+            f"Expected {expected_classes.tolist()}, "
+            f"received {actual_classes.tolist()}."
+        )
+
+    feature_names = np.asarray(
+        transformer.get_feature_names_out(),
+        dtype=object,
+    )
+
     parameters = extract_class_score_parameters(classifier)
 
-    if parameters.coefficients.shape[1] != len(feature_names):
-        raise ValueError(
-            "The fitted coefficient count does not match the transformed "
-            "feature-name count."
+    parameter_classes = np.asarray(
+        [str(value) for value in parameters.classes],
+        dtype=object,
+    )
+
+    if not np.array_equal(
+        parameter_classes,
+        actual_classes,
+    ):
+        raise RuntimeError(
+            "Extracted class-score parameters do not match the "
+            "fitted classifier classes. "
+            f"Classifier classes: {actual_classes.tolist()}; "
+            f"parameter classes: {parameter_classes.tolist()}."
+        )
+
+    if parameters.intercepts.shape != (len(actual_classes),):
+        raise RuntimeError(
+            "The number of normalized intercepts does not match "
+            "the number of target classes. "
+            f"Received {parameters.intercepts.shape}; expected "
+            f"({len(actual_classes)},)."
+        )
+
+    expected_coefficient_shape = (
+        len(actual_classes),
+        len(feature_names),
+    )
+
+    if parameters.coefficients.shape != (expected_coefficient_shape):
+        raise RuntimeError(
+            "The normalized coefficient matrix has an unexpected "
+            "shape. "
+            f"Received {parameters.coefficients.shape}; expected "
+            f"{expected_coefficient_shape}."
         )
 
     rows: list[dict[str, object]] = []
 
-    for class_index, class_name in enumerate(parameters.classes):
+    for class_index, class_name in enumerate(parameter_classes):
         rows.append(
             {
                 "class": str(class_name),
@@ -531,7 +820,77 @@ def fit_final_model(config, model, X, y, store):
             )
         )
 
-    pd.DataFrame(rows).to_csv(
+    components = pd.DataFrame(
+        rows,
+        columns=[
+            "class",
+            "component",
+            "coefficient",
+        ],
+    )
+
+    expected_component_rows = len(actual_classes) * (len(feature_names) + 1)
+
+    if len(components) != expected_component_rows:
+        raise RuntimeError(
+            "The exported component-row count is incorrect. "
+            f"Received {len(components)} rows; expected "
+            f"{expected_component_rows}."
+        )
+
+    directory = store.models / model.id
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model_path = directory / "model.joblib"
+    temporary_model_path = directory / "model.joblib.tmp"
+
+    if temporary_model_path.exists():
+        temporary_model_path.unlink()
+
+    joblib.dump(
+        pipeline,
+        temporary_model_path,
+    )
+
+    temporary_model_path.replace(model_path)
+
+    write_json_atomic(
+        directory / "best_parameters.json",
+        {
+            "n_knots": int(best["n_knots"]),
+            "degree": int(best["degree"]),
+            "C": float(best["C"]),
+            "interaction_scale": float(best["interaction_scale"]),
+            "mean_log_loss": float(best["mean_log_loss"]),
+            "std_log_loss": float(best["std_log_loss"]),
+        },
+    )
+
+    trials.to_parquet(
+        directory / "search_trials.parquet",
+        index=False,
+    )
+
+    components.to_csv(
         directory / "components.csv",
         index=False,
+    )
+
+    write_json_atomic(
+        directory / "model_metadata.json",
+        {
+            "model_id": model.id,
+            "fitted_at_utc": utc_now(),
+            "training_rows": len(X),
+            "predictor_count": X.shape[1],
+            "transformed_feature_count": len(feature_names),
+            "classification_type": (
+                "binary" if len(actual_classes) == 2 else "multiclass"
+            ),
+            "class_count": len(actual_classes),
+            "classes": actual_classes.tolist(),
+        },
     )
