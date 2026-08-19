@@ -14,7 +14,14 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, log_loss
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    log_loss,
+    multilabel_confusion_matrix,
+    precision_recall_fscore_support,
+)
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 
 from .config import ExperimentConfig, ModelConfig
@@ -40,6 +47,7 @@ class OuterFoldResult:
     repeat: int
     fold: int
     metrics: dict[str, Any]
+    class_metrics: pd.DataFrame
     trials: pd.DataFrame
     predictions: pd.DataFrame
     fitted_model: Any
@@ -103,15 +111,94 @@ def inner_search(
     return best, pd.DataFrame(rows)
 
 
-def _fold_metrics(y_true, predictions, probabilities, classes) -> dict[str, float]:
-    return {
-        "log_loss": float(log_loss(y_true, probabilities, labels=classes)),
-        "accuracy": float(accuracy_score(y_true, predictions)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, predictions)),
-        "macro_f1": float(
-            f1_score(y_true, predictions, average="macro", zero_division=0)
+def _fold_metrics(
+    y_true: pd.Series,
+    predictions: np.ndarray,
+    probabilities: np.ndarray,
+    classes: np.ndarray,
+) -> dict[str, float]:
+    """Calculate aggregate metrics for one outer test fold."""
+
+    confusion_matrices = multilabel_confusion_matrix(
+        y_true,
+        predictions,
+        labels=classes,
+    )
+
+    true_negatives = confusion_matrices[
+        :,
+        0,
+        0,
+    ].astype(np.float64)
+
+    false_positives = confusion_matrices[
+        :,
+        0,
+        1,
+    ].astype(np.float64)
+
+    specificity_by_class = _safe_ratio(
+        true_negatives,
+        true_negatives + false_positives,
+    )
+
+    class_support = np.asarray(
+        [int((np.asarray(y_true) == class_name).sum()) for class_name in classes],
+        dtype=np.float64,
+    )
+
+    macro_specificity = float(np.mean(specificity_by_class))
+
+    if class_support.sum() == 0:
+        weighted_specificity = 0.0
+    else:
+        weighted_specificity = float(
+            np.average(
+                specificity_by_class,
+                weights=class_support,
+            )
+        )
+
+    metrics: dict[str, float] = {
+        "log_loss": float(
+            log_loss(
+                y_true,
+                probabilities,
+                labels=classes,
+            )
         ),
+        "accuracy": float(
+            accuracy_score(
+                y_true,
+                predictions,
+            )
+        ),
+        "balanced_accuracy": float(
+            balanced_accuracy_score(
+                y_true,
+                predictions,
+            )
+        ),
+        "macro_f1": float(
+            f1_score(
+                y_true,
+                predictions,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "macro_specificity": macro_specificity,
+        "weighted_specificity": weighted_specificity,
     }
+
+    for class_index, class_name in enumerate(classes):
+        safe_class_name = str(class_name)
+
+        metrics[f"specificity_{safe_class_name}"] = float(
+            specificity_by_class[class_index]
+        )
+
+    return metrics
 
 
 def build_outer_fold_tasks(
@@ -376,6 +463,16 @@ def execute_outer_fold_task(
         **_fold_metrics(y.iloc[test], predictions, probabilities, classes),
         **{f"best_{key}": value for key, value in best.items()},
     }
+
+    class_metrics = calculate_class_metrics(
+        y_true=y.iloc[test],
+        predictions=predictions,
+        classes=classes,
+        model_id=task.model.id,
+        repeat=task.repeat,
+        fold=task.fold,
+    )
+
     prediction_frame = pd.DataFrame(
         {
             "model_id": task.model.id,
@@ -394,6 +491,7 @@ def execute_outer_fold_task(
         repeat=task.repeat,
         fold=task.fold,
         metrics=metrics,
+        class_metrics=class_metrics,
         trials=trials,
         predictions=prediction_frame,
         fitted_model=pipeline,
@@ -505,30 +603,79 @@ def write_fold_checkpoint(
     data_hash: str,
     config_hash: str,
 ) -> None:
-    temporary = checkpoint.with_name(checkpoint.name + ".tmp")
+    """Write one completed outer-fold checkpoint atomically."""
+
+    temporary = checkpoint.with_name(f"{checkpoint.name}.tmp")
+
     if temporary.exists():
         shutil.rmtree(temporary)
-    temporary.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        temporary / "checkpoint.json",
-        {
-            "model_id": result.model_id,
-            "repeat": result.repeat,
-            "fold": result.fold,
-            "data_hash": data_hash,
-            "config_hash": config_hash,
-            "completed_at_utc": utc_now(),
-        },
+
+    temporary.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    write_json_atomic(temporary / "metrics.json", result.metrics)
-    result.trials.to_parquet(temporary / "trials.parquet", index=False)
-    result.predictions.to_parquet(temporary / "predictions.parquet", index=False)
-    joblib.dump(result.fitted_model, temporary / "model.joblib")
-    (temporary / "COMPLETE").touch()
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    if checkpoint.exists():
-        shutil.rmtree(checkpoint)
-    temporary.replace(checkpoint)
+
+    try:
+        write_json_atomic(
+            temporary / "checkpoint.json",
+            {
+                "model_id": result.model_id,
+                "repeat": result.repeat,
+                "fold": result.fold,
+                "data_hash": data_hash,
+                "config_hash": config_hash,
+                "completed_at_utc": utc_now(),
+            },
+        )
+
+        write_json_atomic(
+            temporary / "metrics.json",
+            result.metrics,
+        )
+
+        result.class_metrics.to_parquet(
+            temporary / "class_metrics.parquet",
+            index=False,
+        )
+
+        result.trials.to_parquet(
+            temporary / "trials.parquet",
+            index=False,
+        )
+
+        result.predictions.to_parquet(
+            temporary / "predictions.parquet",
+            index=False,
+        )
+
+        joblib.dump(
+            result.fitted_model,
+            temporary / "model.joblib",
+        )
+
+        (temporary / "COMPLETE").write_text(
+            "completed\n",
+            encoding="utf-8",
+        )
+
+        checkpoint.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        if checkpoint.exists():
+            shutil.rmtree(checkpoint)
+
+        temporary.replace(checkpoint)
+
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(
+                temporary,
+                ignore_errors=True,
+            )
+
+        raise
 
 
 def rebuild_model_results(
@@ -559,7 +706,16 @@ def rebuild_model_results(
     model_results.mkdir(parents=True, exist_ok=True)
     fold_frame.to_csv(model_results / "fold_metrics.csv", index=False)
     predictions.to_parquet(model_results / "predictions.parquet", index=False)
-    metric_columns = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
+
+    metric_columns = [
+        "log_loss",
+        "accuracy",
+        "balanced_accuracy",
+        "macro_f1",
+        "macro_specificity",
+        "weighted_specificity",
+    ]
+
     fold_frame[metric_columns].agg(["mean", "std", "median", "min", "max"]).T.to_csv(
         model_results / "summary.csv"
     )
@@ -893,4 +1049,74 @@ def fit_final_model(
             "class_count": len(actual_classes),
             "classes": actual_classes.tolist(),
         },
+    )
+
+
+def _safe_ratio(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+) -> np.ndarray:
+    result = np.zeros_like(
+        numerator,
+        dtype=np.float64,
+    )
+
+    np.divide(
+        numerator,
+        denominator,
+        out=result,
+        where=denominator != 0,
+    )
+
+    return result
+
+
+def calculate_class_metrics(
+    y_true: pd.Series,
+    predictions: np.ndarray,
+    classes: np.ndarray,
+    *,
+    model_id: str,
+    repeat: int,
+    fold: int,
+) -> pd.DataFrame:
+    confusion_matrices = multilabel_confusion_matrix(
+        y_true,
+        predictions,
+        labels=classes,
+    )
+
+    true_negatives = confusion_matrices[:, 0, 0]
+    false_positives = confusion_matrices[:, 0, 1]
+    false_negatives = confusion_matrices[:, 1, 0]
+    true_positives = confusion_matrices[:, 1, 1]
+
+    specificity = _safe_ratio(
+        true_negatives.astype(np.float64),
+        (true_negatives + false_positives).astype(np.float64),
+    )
+
+    precision, sensitivity, f1, support = precision_recall_fscore_support(
+        y_true,
+        predictions,
+        labels=classes,
+        zero_division=0,
+    )
+
+    return pd.DataFrame(
+        {
+            "model_id": model_id,
+            "repeat": repeat,
+            "fold": fold,
+            "class": [str(value) for value in classes],
+            "true_negative": true_negatives,
+            "false_positive": false_positives,
+            "false_negative": false_negatives,
+            "true_positive": true_positives,
+            "sensitivity": sensitivity,
+            "specificity": specificity,
+            "precision": precision,
+            "f1": f1,
+            "support": support,
+        }
     )

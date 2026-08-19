@@ -6,6 +6,7 @@ configs/
 profile/
 workspace/
 comparisons/
+predictions/
 
 # ==========================================
 # Python Bytecode & Cache
