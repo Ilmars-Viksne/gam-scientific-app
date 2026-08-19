@@ -51,7 +51,8 @@ def test_validate_training_data_less_than_two_classes(tmp_path):
     df.to_csv(cfg.data_path, index=False)
 
     with pytest.raises(
-        DataValidationError, match="Classification requires at least two target classes."
+        DataValidationError,
+        match="Classification requires at least two target classes.",
     ):
         validate_training_data(cfg)
 
@@ -69,7 +70,10 @@ def test_validate_training_data_smallest_class_less_than_outer_splits(tmp_path):
 
     with pytest.raises(
         DataValidationError,
-        match=r"The least frequent target class contains 3 observations, but outer_splits=5\.",
+        match=(
+            r"The least frequent target class contains 3 observations, "
+            r"but outer_splits=5\."
+        ),
     ):
         validate_training_data(cfg)
 
@@ -90,7 +94,10 @@ def test_validate_training_data_outer_ok_inner_fail(tmp_path):
 
     with pytest.raises(
         DataValidationError,
-        match=r"The least frequent target class may contain only 4 observations in an outer training partition, but inner_splits=5\.",
+        match=(
+            r"The least frequent target class may contain only 4 observations "
+            r"in an outer training partition, but inner_splits=5\."
+        ),
     ):
         validate_training_data(cfg)
 

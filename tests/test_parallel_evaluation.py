@@ -12,7 +12,6 @@ from gam_app.config import (
     SearchConfig,
     ValidationConfig,
 )
-from gam_app.exceptions import ConfigurationError
 from gam_app.evaluation import (
     OuterFoldResult,
     build_outer_fold_tasks,
@@ -21,6 +20,7 @@ from gam_app.evaluation import (
     run_outer_folds_in_parallel,
     run_outer_folds_sequentially,
 )
+from gam_app.exceptions import ConfigurationError
 
 
 def config(
