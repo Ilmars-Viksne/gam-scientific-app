@@ -652,35 +652,6 @@ class GAMFeatureTransformer(
         # Interaction validation
         #
 
-        eligible_interaction_features = set(self.smooth_features) | set(
-            self.linear_features
-        )
-
-        for left_name, right_name in self.interaction_pairs:
-            if left_name == right_name:
-                raise ValueError(
-                    "An interaction pair cannot contain the same "
-                    f"feature twice: {left_name!r}."
-                )
-
-            unavailable_features = {
-                left_name,
-                right_name,
-            } - eligible_interaction_features
-
-            if unavailable_features:
-                raise ValueError(
-                    "Interaction pairs may contain only configured "
-                    "smooth or linear features. Invalid features: "
-                    f"{sorted(unavailable_features)}."
-                )
-
-        self.is_fitted_ = True
-
-        #
-        # Interaction validation
-        #
-
         for left_name, right_name in self.interaction_pairs:
             if left_name == right_name:
                 raise ValueError(
@@ -921,26 +892,12 @@ class GAMFeatureTransformer(
             left_matrix = numeric_feature_matrices[left_name]
             right_matrix = numeric_feature_matrices[right_name]
 
-            # For each observation, calculate the tensor product of the
-            # transformed left and right feature representations.
-            #
-            # Shapes:
-            #     left_matrix:       (rows, left_basis_count)
-            #     right_matrix:      (rows, right_basis_count)
-            #     interaction_cube:  (rows, left_basis_count,
-            #                         right_basis_count)
-            interaction_cube = np.einsum(
-                "ij,ik->ijk",
+            interaction_matrix = self._tensor_product(
                 left_matrix,
                 right_matrix,
             )
 
-            interaction_matrix = interaction_cube.reshape(
-                len(X),
-                -1,
-            )
-
-            interaction_matrix = interaction_matrix * float(self.interaction_scale)
+            interaction_matrix *= float(self.interaction_scale)
 
             transformed_parts.append(interaction_matrix)
 

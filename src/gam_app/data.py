@@ -104,32 +104,32 @@ def validate_training_data(
     if target.isna().any():
         raise DataValidationError("Missing target values are not supported.")
     if target.nunique() < 2:
-        class_counts = target.astype(str).value_counts()
-        smallest_class_count = int(class_counts.min())
-
-        outer_splits = config.validation.outer_splits
-        inner_splits = config.validation.inner_splits
-
-        if smallest_class_count < outer_splits:
-            raise DataValidationError(
-                "The least frequent target class contains "
-                f"{smallest_class_count} observations, but "
-                f"outer_splits={outer_splits}."
-            )
-
-        largest_outer_test_count = int(np.ceil(smallest_class_count / outer_splits))
-
-        smallest_outer_train_count = smallest_class_count - largest_outer_test_count
-
-        if smallest_outer_train_count < inner_splits:
-            raise DataValidationError(
-                "The least frequent target class may contain only "
-                f"{smallest_outer_train_count} observations in an outer "
-                f"training partition, but inner_splits={inner_splits}."
-            )
-
         raise DataValidationError(
             "Classification requires at least two target classes."
+        )
+
+    class_counts = target.astype(str).value_counts()
+    smallest_class_count = int(class_counts.min())
+
+    outer_splits = config.validation.outer_splits
+    inner_splits = config.validation.inner_splits
+
+    if smallest_class_count < outer_splits:
+        raise DataValidationError(
+            "The least frequent target class contains "
+            f"{smallest_class_count} observations, but "
+            f"outer_splits={outer_splits}."
+        )
+
+    largest_outer_test_count = int(np.ceil(smallest_class_count / outer_splits))
+
+    smallest_outer_train_count = smallest_class_count - largest_outer_test_count
+
+    if smallest_outer_train_count < inner_splits:
+        raise DataValidationError(
+            "The least frequent target class may contain only "
+            f"{smallest_outer_train_count} observations in an "
+            f"outer training partition, but inner_splits={inner_splits}."
         )
 
     active = [name for name, spec in config.features.items() if spec.role != "exclude"]
