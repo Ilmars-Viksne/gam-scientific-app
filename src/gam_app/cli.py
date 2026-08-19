@@ -270,14 +270,21 @@ def command_compare(args) -> None:
 def command_predict(args) -> None:
     model = joblib.load(args.model)
     frame = load_table(args.input)
+
     probabilities = model.predict_proba(frame)
     classes = model.named_steps["classifier"].classes_
+
     output = pd.DataFrame(
-        probabilities, columns=[f"probability_{name}" for name in classes]
+        probabilities,
+        columns=[f"probability_{name}" for name in classes],
     )
     output["predicted_class"] = classes[np.argmax(probabilities, axis=1)]
-    output.to_csv(args.output, index=False)
-    print(f"Predictions written to {args.output.resolve()}")
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output.to_csv(output_path, index=False)
+
+    print(f"Predictions written to {output_path.resolve()}")
 
 
 def command_demo(args) -> None:
