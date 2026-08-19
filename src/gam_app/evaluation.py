@@ -686,6 +686,7 @@ def rebuild_model_results(
 ) -> None:
     fold_rows = []
     prediction_frames = []
+    class_metric_frames = []
     for task in sorted(tasks, key=lambda item: (item.repeat, item.fold)):
         if not store.checkpoint_complete(
             task.model.id, task.repeat, task.fold, data_hash, config_hash
@@ -699,13 +700,19 @@ def rebuild_model_results(
             json.loads((checkpoint / "metrics.json").read_text(encoding="utf-8"))
         )
         prediction_frames.append(pd.read_parquet(checkpoint / "predictions.parquet"))
+        class_metric_frames.append(
+            pd.read_parquet(checkpoint / "class_metrics.parquet")
+        )
 
     fold_frame = pd.DataFrame(fold_rows)
     predictions = pd.concat(prediction_frames, ignore_index=True)
+    class_metrics = pd.concat(class_metric_frames, ignore_index=True)
+
     model_results = store.results / tasks[0].model.id
     model_results.mkdir(parents=True, exist_ok=True)
     fold_frame.to_csv(model_results / "fold_metrics.csv", index=False)
     predictions.to_parquet(model_results / "predictions.parquet", index=False)
+    class_metrics.to_csv(model_results / "class_metrics.csv", index=False)
 
     metric_columns = [
         "log_loss",
@@ -719,6 +726,19 @@ def rebuild_model_results(
     fold_frame[metric_columns].agg(["mean", "std", "median", "min", "max"]).T.to_csv(
         model_results / "summary.csv"
     )
+
+    class_metrics_summary = class_metrics.groupby("class", sort=True)[
+        ["sensitivity", "specificity", "precision", "f1"]
+    ].agg(["mean", "std", "median", "min", "max"])
+
+    class_metrics_summary[("support", "mean_fold_support")] = class_metrics.groupby(
+        "class", sort=True
+    )["support"].mean()
+    class_metrics_summary[("support", "total_oof_support")] = class_metrics.groupby(
+        "class", sort=True
+    )["support"].sum()
+
+    class_metrics_summary.to_csv(model_results / "class_metrics_summary.csv")
 
 
 def run_model(
