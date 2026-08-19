@@ -12,6 +12,7 @@ from gam_app.config import (
     SearchConfig,
     ValidationConfig,
 )
+from gam_app.exceptions import ConfigurationError
 from gam_app.evaluation import (
     OuterFoldResult,
     build_outer_fold_tasks,
@@ -108,6 +109,14 @@ def assert_outer_fold_results_equal(
     assert_metrics_equal(
         actual.metrics,
         expected.metrics,
+    )
+
+    pd.testing.assert_frame_equal(
+        actual.class_metrics,
+        expected.class_metrics,
+        check_exact=False,
+        rtol=1e-12,
+        atol=1e-12,
     )
 
     pd.testing.assert_frame_equal(
@@ -372,7 +381,7 @@ def test_invalid_worker_count_is_rejected(
     )
 
     with pytest.raises(
-        Exception,
-        match="execution\\.workers must be at least 1",
+        ConfigurationError,
+        match=r"execution\.workers must be at least 1",
     ):
         cfg.validate()
