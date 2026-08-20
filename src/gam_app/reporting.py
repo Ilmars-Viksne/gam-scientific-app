@@ -45,9 +45,7 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
         sections.append(
             f"<p><strong>Number of active predictors:</strong> {len(predictors)}</p>"
         )
-        sections.append(
-            f"<p><strong>Target:</strong> {html.escape(str(target))}</p>"
-        )
+        sections.append(f"<p><strong>Target:</strong> {html.escape(str(target))}</p>")
         sections.append("<h3>Class distribution</h3>")
         sections.append(dist_df.to_html(index=False))
 
@@ -62,10 +60,7 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
         if metadata_path.exists():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             meta_df = pd.DataFrame(
-                [
-                    {"property": k, "value": str(v)}
-                    for k, v in metadata.items()
-                ]
+                [{"property": k, "value": str(v)} for k, v in metadata.items()]
             )
             sections.append("<h3>Final-model metadata</h3>")
             sections.append(meta_df.to_html(index=False))
@@ -85,23 +80,18 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
             )
 
         sections.append("<h3>Nested CV metric summary</h3>")
-        sections.append(
-            summary.to_html(float_format=lambda value: f"{value:.6f}")
-        )
+        sections.append(summary.to_html(float_format=lambda value: f"{value:.6f}"))
 
         class_metrics_path = result_dir / "class_metrics.csv"
         if class_metrics_path.exists():
             class_metrics = pd.read_csv(class_metrics_path)
-            class_summary = (
-                class_metrics.groupby("class", as_index=False)
-                .agg(
-                    sensitivity_mean=("sensitivity", "mean"),
-                    specificity_mean=("specificity", "mean"),
-                    precision_mean=("precision", "mean"),
-                    f1_mean=("f1", "mean"),
-                    mean_fold_support=("support", "mean"),
-                    total_oof_support=("support", "sum"),
-                )
+            class_summary = class_metrics.groupby("class", as_index=False).agg(
+                sensitivity_mean=("sensitivity", "mean"),
+                specificity_mean=("specificity", "mean"),
+                precision_mean=("precision", "mean"),
+                f1_mean=("f1", "mean"),
+                mean_fold_support=("support", "mean"),
+                total_oof_support=("support", "sum"),
             )
             class_summary["total_oof_support"] = class_summary[
                 "total_oof_support"
@@ -141,9 +131,7 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
 
         sections.append("<h3>Confusion matrices</h3>")
         sections.append("<p><strong>Pooled raw count matrix:</strong></p>")
-        sections.append(
-            f'<img src="../plots/{raw_path.name}" alt="Confusion matrix">'
-        )
+        sections.append(f'<img src="../plots/{raw_path.name}" alt="Confusion matrix">')
         sections.append("<p><strong>Pooled row-normalized matrix:</strong></p>")
         sections.append(
             f'<img src="../plots/{norm_path.name}" alt="Normalized confusion matrix">'
@@ -157,14 +145,10 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
 
         total_predictions = len(predictions)
         unique_obs = (
-            predictions["row_id"].nunique()
-            if "row_id" in predictions.columns
-            else ""
+            predictions["row_id"].nunique() if "row_id" in predictions.columns else ""
         )
         outer_repeats = (
-            predictions["repeat"].nunique()
-            if "repeat" in predictions.columns
-            else ""
+            predictions["repeat"].nunique() if "repeat" in predictions.columns else ""
         )
 
         count_info = []

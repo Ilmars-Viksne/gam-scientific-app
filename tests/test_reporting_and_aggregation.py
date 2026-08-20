@@ -272,8 +272,7 @@ def test_create_reports_generates_expected_outputs(
     assert "Confusion matrices" in html_content
     assert "Pooled row-normalized matrix" in html_content
     assert (
-        "These confusion matrices pool held-out outer-fold predictions"
-        in html_content
+        "These confusion matrices pool held-out outer-fold predictions" in html_content
     )
     assert "Detailed per-class fold metrics" in html_content
 
