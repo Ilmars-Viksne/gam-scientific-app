@@ -921,8 +921,7 @@ def run_model(
     elapsed = perf_counter() - model_started_at
 
     print(
-        f"[{model.id}] Outer-fold evaluation completed "
-        f"in {format_duration(elapsed)}",
+        f"[{model.id}] Outer-fold evaluation completed in {format_duration(elapsed)}",
         flush=True,
     )
 

@@ -32,11 +32,7 @@ def format_duration(seconds: float) -> str:
         60,
     )
 
-    return (
-        f"{hours:02d}:"
-        f"{minutes:02d}:"
-        f"{remaining_seconds:02d}"
-    )
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
 
 def sha256_file(path: Path) -> str:

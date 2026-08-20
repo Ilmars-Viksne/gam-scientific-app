@@ -109,8 +109,7 @@ def execute_run(run_directory: Path) -> None:
             if store.requested("PAUSE") or store.requested("CANCEL"):
                 return
             print(
-                f"[{model.id}] Fitting final model on "
-                f"{len(X)} observations",
+                f"[{model.id}] Fitting final model on {len(X)} observations",
                 flush=True,
             )
             final_fit_started_at = perf_counter()
@@ -126,8 +125,7 @@ def execute_run(run_directory: Path) -> None:
         )
         store.event("run_completed")
         print(
-            "Run completed in "
-            f"{format_duration(perf_counter() - run_started_at)}",
+            f"Run completed in {format_duration(perf_counter() - run_started_at)}",
             flush=True,
         )
     except Exception as error:
