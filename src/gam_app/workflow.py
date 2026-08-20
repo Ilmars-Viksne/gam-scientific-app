@@ -5,6 +5,7 @@ import platform
 import sys
 import uuid
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 import sklearn
@@ -14,6 +15,7 @@ from .config import dump_config_dict, load_config
 from .data import validate_training_data
 from .evaluation import create_split_manifest, fit_final_model, run_model
 from .io_utils import (
+    format_duration,
     sha256_file,
     stable_hash,
     utc_now,
@@ -63,6 +65,7 @@ def create_run(config_path: Path, workspace: Path) -> Path:
 
 
 def execute_run(run_directory: Path) -> None:
+    run_started_at = perf_counter()
     store = FileRunStore(run_directory)
     store.acquire_lock()
     try:
@@ -105,12 +108,28 @@ def execute_run(run_directory: Path) -> None:
             )
             if store.requested("PAUSE") or store.requested("CANCEL"):
                 return
+            print(
+                f"[{model.id}] Fitting final model on "
+                f"{len(X)} observations",
+                flush=True,
+            )
+            final_fit_started_at = perf_counter()
             fit_final_model(config, model, X, y, store)
+            print(
+                f"[{model.id}] Final model completed in "
+                f"{format_duration(perf_counter() - final_fit_started_at)}",
+                flush=True,
+            )
         create_reports(config, store)
         store.update_status(
             state="completed", phase="reporting", completed_at_utc=utc_now()
         )
         store.event("run_completed")
+        print(
+            "Run completed in "
+            f"{format_duration(perf_counter() - run_started_at)}",
+            flush=True,
+        )
     except Exception as error:
         store.update_status(state="failed", error=repr(error))
         store.event("run_failed", level="ERROR", error=repr(error))

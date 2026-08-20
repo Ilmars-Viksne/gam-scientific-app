@@ -14,6 +14,31 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def format_duration(seconds: float) -> str:
+    """Format elapsed seconds as HH:MM:SS."""
+
+    total_seconds = max(
+        0,
+        int(round(seconds)),
+    )
+
+    hours, remainder = divmod(
+        total_seconds,
+        3600,
+    )
+
+    minutes, remaining_seconds = divmod(
+        remainder,
+        60,
+    )
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{remaining_seconds:02d}"
+    )
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
