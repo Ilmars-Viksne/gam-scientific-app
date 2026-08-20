@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import joblib
@@ -25,7 +26,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 
 from .config import ExperimentConfig, ModelConfig
-from .io_utils import utc_now, write_json_atomic
+from .io_utils import format_duration, utc_now, write_json_atomic
 from .logistic import extract_class_score_parameters
 from .models import build_pipeline
 from .run_store import FileRunStore
@@ -822,6 +823,17 @@ def run_model(
 
     completed_outer_folds = len(all_tasks) - len(pending_tasks)
 
+    model_started_at = perf_counter()
+
+    print(
+        f"[{model.id}] Starting outer-fold evaluation: "
+        f"{len(pending_tasks)} pending, "
+        f"{completed_outer_folds} restored, "
+        f"{total} total, "
+        f"{config.execution.workers} worker(s)",
+        flush=True,
+    )
+
     def on_started(task: OuterFoldTask) -> None:
         store.update_status(
             state="running",
@@ -861,6 +873,19 @@ def run_model(
             log_loss=result.metrics["log_loss"],
         )
 
+        elapsed = perf_counter() - model_started_at
+        log_loss_value = float(result.metrics["log_loss"])
+
+        print(
+            f"[{result.model_id}] "
+            f"{completed_outer_folds:>{len(str(total))}}/"
+            f"{total} completed"
+            f" | repeat {result.repeat}, fold {result.fold}"
+            f" | log_loss={log_loss_value:.4f}"
+            f" | elapsed={format_duration(elapsed)}",
+            flush=True,
+        )
+
     if config.execution.workers == 1:
         run_outer_folds_sequentially(
             pending_tasks,
@@ -892,6 +917,14 @@ def run_model(
         return
 
     rebuild_model_results(all_tasks, store, data_hash, config_hash)
+
+    elapsed = perf_counter() - model_started_at
+
+    print(
+        f"[{model.id}] Outer-fold evaluation completed "
+        f"in {format_duration(elapsed)}",
+        flush=True,
+    )
 
 
 def fit_final_model(
