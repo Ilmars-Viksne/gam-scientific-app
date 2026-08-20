@@ -452,7 +452,13 @@ def execute_outer_fold_task(
         C=float(best["C"]),
         interaction_scale=float(best["interaction_scale"]),
     )
-    pipeline.fit(X.iloc[train], y.iloc[train])
+    with warnings.catch_warnings():
+        if config.execution.stop_on_convergence_warning:
+            warnings.filterwarnings(
+                "error",
+                category=ConvergenceWarning,
+            )
+        pipeline.fit(X.iloc[train], y.iloc[train])
     probabilities = pipeline.predict_proba(X.iloc[test])
     predictions = pipeline.predict(X.iloc[test])
     classes = pipeline.named_steps["classifier"].classes_
@@ -498,6 +504,15 @@ def execute_outer_fold_task(
     )
 
 
+def _check_stop_requested(should_stop: Callable[[], Any]) -> str | None:
+    val = should_stop()
+    if not val:
+        return None
+    if isinstance(val, str):
+        return val
+    return "stop"
+
+
 def run_outer_folds_sequentially(
     tasks: Iterable[OuterFoldTask],
     config: ExperimentConfig,
@@ -506,8 +521,11 @@ def run_outer_folds_sequentially(
     row_ids: pd.Series,
     on_started: Callable[[OuterFoldTask], None],
     on_completed: OuterFoldCallback,
+    should_stop: Callable[[], Any] = lambda: None,
 ) -> None:
     for task in tasks:
+        if _check_stop_requested(should_stop) is not None:
+            break
         on_started(task)
         result = execute_outer_fold_task(task, config, X, y, row_ids)
         on_completed(result)
@@ -522,7 +540,7 @@ def run_outer_folds_in_parallel(
     workers: int,
     on_started: Callable[[OuterFoldTask], None],
     on_completed: OuterFoldCallback,
-    should_stop: Callable[[], bool],
+    should_stop: Callable[[], Any] = lambda: None,
 ) -> None:
     task_iterator = iter(tasks)
     maximum_workers = workers
@@ -532,10 +550,14 @@ def run_outer_folds_in_parallel(
         OuterFoldTask,
     ] = {}
 
+    stopping = False
+
     def submit_next(
         executor: ProcessPoolExecutor,
     ) -> bool:
-        if should_stop():
+        nonlocal stopping
+        if stopping or _check_stop_requested(should_stop) is not None:
+            stopping = True
             return False
 
         try:
@@ -565,11 +587,14 @@ def run_outer_folds_in_parallel(
                 break
 
         while future_tasks:
-            if should_stop():
-                for future in future_tasks:
-                    future.cancel()
+            if not stopping and _check_stop_requested(should_stop) is not None:
+                stopping = True
+                for future in list(future_tasks.keys()):
+                    if future.cancel():
+                        future_tasks.pop(future, None)
 
-                return
+            if not future_tasks:
+                break
 
             done, _ = wait(
                 future_tasks,
@@ -579,6 +604,9 @@ def run_outer_folds_in_parallel(
 
             for future in done:
                 task = future_tasks.pop(future)
+
+                if future.cancelled():
+                    continue
 
                 try:
                     result = future.result()
@@ -594,7 +622,8 @@ def run_outer_folds_in_parallel(
                     ) from error
 
                 on_completed(result)
-                submit_next(executor)
+                if not stopping:
+                    submit_next(executor)
 
 
 def write_fold_checkpoint(
@@ -761,13 +790,29 @@ def run_model(
     )
 
     total = config.validation.outer_splits * config.validation.outer_repeats
+
+    stop_event_recorded = False
+
+    def should_stop() -> str | None:
+        nonlocal stop_event_recorded
+        if store.requested("CANCEL"):
+            if not stop_event_recorded:
+                store.event("cancel_requested")
+                stop_event_recorded = True
+            return "cancelled"
+        if store.requested("PAUSE"):
+            if not stop_event_recorded:
+                store.event("pause_requested")
+                stop_event_recorded = True
+            return "paused"
+        return None
+
     pending_tasks = []
     for task in all_tasks:
-        if store.requested("CANCEL"):
-            store.update_status(state="cancelled")
-            return
-        if store.requested("PAUSE"):
-            store.update_status(state="paused")
+        stop_state = should_stop()
+        if stop_state is not None:
+            store.update_status(state=stop_state)
+            store.event(f"run_{stop_state}")
             return
         if store.checkpoint_complete(
             model.id, task.repeat, task.fold, data_hash, config_hash
@@ -776,15 +821,6 @@ def run_model(
         pending_tasks.append(task)
 
     completed_outer_folds = len(all_tasks) - len(pending_tasks)
-
-    def should_stop() -> bool:
-        if store.requested("CANCEL"):
-            store.update_status(state="cancelled")
-            return True
-        if store.requested("PAUSE"):
-            store.update_status(state="paused")
-            return True
-        return False
 
     def on_started(task: OuterFoldTask) -> None:
         store.update_status(
@@ -834,6 +870,7 @@ def run_model(
             row_ids,
             on_started,
             on_completed,
+            should_stop,
         )
     else:
         run_outer_folds_in_parallel(
@@ -848,7 +885,10 @@ def run_model(
             should_stop,
         )
 
-    if should_stop():
+    stop_state = should_stop()
+    if stop_state is not None:
+        store.update_status(state=stop_state)
+        store.event(f"run_{stop_state}")
         return
 
     rebuild_model_results(all_tasks, store, data_hash, config_hash)

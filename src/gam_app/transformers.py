@@ -10,6 +10,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import (
     OneHotEncoder,
     SplineTransformer,
+    StandardScaler,
 )
 from sklearn.utils.validation import check_is_fitted
 
@@ -439,6 +440,11 @@ class GAMFeatureTransformer(
             SimpleImputer | None,
         ] = {}
 
+        self.linear_scalers_: dict[
+            str,
+            StandardScaler,
+        ] = {}
+
         self.categorical_imputers_: dict[
             str,
             SimpleImputer | None,
@@ -511,12 +517,13 @@ class GAMFeatureTransformer(
                     )
 
                 imputer = None
+                prepared = values.to_numpy(dtype=np.float64)
 
             elif missing_policy == "median":
                 imputer = SimpleImputer(
                     strategy="median",
                 )
-                imputer.fit(values)
+                prepared = imputer.fit_transform(values)
 
             else:
                 raise ValueError(
@@ -525,7 +532,11 @@ class GAMFeatureTransformer(
                     f"{feature_name!r}."
                 )
 
+            scaler = StandardScaler()
+            scaler.fit(prepared)
+
             self.linear_imputers_[feature_name] = imputer
+            self.linear_scalers_[feature_name] = scaler
 
         #
         # Categorical features
@@ -692,6 +703,7 @@ class GAMFeatureTransformer(
                 "smooth_imputers_",
                 "spline_transformers_",
                 "linear_imputers_",
+                "linear_scalers_",
                 "categorical_imputers_",
                 "categorical_encoder_",
                 "is_fitted_",
@@ -775,14 +787,17 @@ class GAMFeatureTransformer(
                         f"Linear feature {feature_name!r} contains missing values."
                     )
 
-                transformed = values.to_numpy(
+                prepared = values.to_numpy(
                     dtype=np.float64,
                 )
             else:
-                transformed = np.asarray(
+                prepared = np.asarray(
                     imputer.transform(values),
                     dtype=np.float64,
                 )
+
+            scaler = self.linear_scalers_[feature_name]
+            transformed = scaler.transform(prepared)
 
             if transformed.ndim == 1:
                 transformed = transformed.reshape(-1, 1)

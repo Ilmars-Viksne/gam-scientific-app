@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from gam_app.config import (
     ExecutionConfig,
@@ -8,6 +9,7 @@ from gam_app.config import (
     SearchConfig,
     ValidationConfig,
 )
+from gam_app.exceptions import ConfigurationError
 from gam_app.logistic import (
     decision_scores_to_probabilities,
     extract_class_score_parameters,
@@ -267,3 +269,144 @@ def test_binary_score_difference_matches_decision_function(
         model.decision_function(X),
         atol=1e-12,
     )
+
+
+def test_explicit_interaction_validation(tmp_path) -> None:
+    features = {
+        "s1": FeatureConfig("smooth"),
+        "s2": FeatureConfig("smooth"),
+        "l1": FeatureConfig("linear"),
+        "c1": FeatureConfig("categorical", categories=("a", "b")),
+    }
+
+    # smooth-smooth succeeds
+    cfg_ok = ExperimentConfig(
+        name="ok",
+        data_path=tmp_path / "unused.csv",
+        target="target",
+        row_id=None,
+        features=features,
+        models=(
+            ModelConfig(
+                id="m1",
+                interactions="explicit",
+                pairs=(("s1", "s2"),),
+            ),
+        ),
+    )
+    cfg_ok.validate()
+
+    # smooth-linear fails
+    cfg_sl = ExperimentConfig(
+        name="sl",
+        data_path=tmp_path / "unused.csv",
+        target="target",
+        row_id=None,
+        features=features,
+        models=(
+            ModelConfig(
+                id="m1",
+                interactions="explicit",
+                pairs=(("s1", "l1"),),
+            ),
+        ),
+    )
+    with pytest.raises(
+        ConfigurationError,
+        match="Explicit interactions require two distinct smooth predictors",
+    ):
+        cfg_sl.validate()
+
+    # smooth-categorical fails
+    cfg_sc = ExperimentConfig(
+        name="sc",
+        data_path=tmp_path / "unused.csv",
+        target="target",
+        row_id=None,
+        features=features,
+        models=(
+            ModelConfig(
+                id="m1",
+                interactions="explicit",
+                pairs=(("s1", "c1"),),
+            ),
+        ),
+    )
+    with pytest.raises(
+        ConfigurationError,
+        match="Explicit interactions require two distinct smooth predictors",
+    ):
+        cfg_sc.validate()
+
+    # repeated feature fails
+    cfg_rep = ExperimentConfig(
+        name="rep",
+        data_path=tmp_path / "unused.csv",
+        target="target",
+        row_id=None,
+        features=features,
+        models=(
+            ModelConfig(
+                id="m1",
+                interactions="explicit",
+                pairs=(("s1", "s1"),),
+            ),
+        ),
+    )
+    with pytest.raises(
+        ConfigurationError,
+        match="Explicit interactions require two distinct smooth predictors",
+    ):
+        cfg_rep.validate()
+
+    # unknown feature fails
+    cfg_unk = ExperimentConfig(
+        name="unk",
+        data_path=tmp_path / "unused.csv",
+        target="target",
+        row_id=None,
+        features=features,
+        models=(
+            ModelConfig(
+                id="m1",
+                interactions="explicit",
+                pairs=(("s1", "unknown"),),
+            ),
+        ),
+    )
+    with pytest.raises(
+        ConfigurationError,
+        match="Explicit interactions require two distinct smooth predictors",
+    ):
+        cfg_unk.validate()
+
+
+def test_model_id_validation(tmp_path) -> None:
+    features = {"s1": FeatureConfig("smooth")}
+
+    # valid IDs pass
+    for valid_id in ["gam_main", "model-1", "m.1", "Model_123"]:
+        cfg = ExperimentConfig(
+            name="test",
+            data_path=tmp_path / "unused.csv",
+            target="target",
+            row_id=None,
+            features=features,
+            models=(ModelConfig(id=valid_id),),
+        )
+        cfg.validate()
+
+    # invalid IDs fail
+    for invalid_id in ["_invalid", "model/1", "model 1", "-model", "model#1"]:
+        cfg = ExperimentConfig(
+            name="test",
+            data_path=tmp_path / "unused.csv",
+            target="target",
+            row_id=None,
+            features=features,
+            models=(ModelConfig(id=invalid_id),),
+        )
+        with pytest.raises(
+            ConfigurationError, match="Model IDs may contain only letters"
+        ):
+            cfg.validate()

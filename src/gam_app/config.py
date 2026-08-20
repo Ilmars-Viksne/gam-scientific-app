@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -7,6 +8,8 @@ from typing import Any, Literal
 import yaml
 
 from .exceptions import ConfigurationError
+
+MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 Role = Literal["smooth", "linear", "categorical", "exclude"]
 
@@ -82,12 +85,23 @@ class ExperimentConfig:
         model_ids = [model.id for model in self.models]
         if len(model_ids) != len(set(model_ids)):
             raise ConfigurationError("Model IDs must be unique.")
+        for model_id in model_ids:
+            if not MODEL_ID_PATTERN.fullmatch(model_id):
+                raise ConfigurationError(
+                    "Model IDs may contain only letters, numbers, "
+                    "underscores, periods, and hyphens, and must start "
+                    f"with a letter or number: {model_id!r}."
+                )
+
+        smooth = {name for name, spec in self.features.items() if spec.role == "smooth"}
+
         for model in self.models:
             if model.interactions == "explicit":
                 for left, right in model.pairs:
-                    if left not in active or right not in active or left == right:
+                    if left == right or left not in smooth or right not in smooth:
                         raise ConfigurationError(
-                            f"Invalid interaction pair: {left}:{right}"
+                            "Explicit interactions require two distinct "
+                            f"smooth predictors: {left}:{right}"
                         )
         if any(value < 2 for value in self.search.n_knots):
             raise ConfigurationError("Every n_knots value must be at least 2.")

@@ -14,7 +14,8 @@ Generalized Additive Model experiments on tabular datasets.
 - fold-level checkpoints, pause, cancel, and resume
 - out-of-fold probabilities and class metrics
 - final fitted models, exact transformed-space coefficients, and equations
-- main effects, interaction surfaces, confusion matrices, and HTML reports
+- confusion matrices and HTML reports
+- transformed-space component and equation exports
 - comparison of runs with paired fold differences
 - batch prediction with input-schema validation
 - no database or external service
@@ -1058,6 +1059,7 @@ Not yet included:
 - desktop graphical wizard;
 - grouped or temporal CV;
 - stability-aware forward interaction selection;
+- smooth main-effect plots and interaction surface plots;
 - categorical–smooth interactions;
 - functional-ANOVA interaction centering;
 - calibration plots and local explanation dashboards;

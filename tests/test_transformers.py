@@ -175,6 +175,58 @@ def test_configured_category_absent_from_fit_data_is_supported() -> None:
     )
 
 
+def test_linear_feature_standardization(tmp_path: Path) -> None:
+    training = pd.DataFrame(
+        {
+            "lin1": [10.0, 20.0, 30.0, np.nan, 50.0],
+            "smooth1": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+
+    # Median of lin1 [10, 20, 30, 50] is 25.0
+    # Imputed values: [10, 20, 30, 25, 50]
+    transformer = GAMFeatureTransformer(
+        smooth_features=("smooth1",),
+        linear_features=("lin1",),
+        missing_policies=(("lin1", "median"),),
+        n_knots=3,
+        degree=2,
+    )
+
+    matrix = transformer.fit_transform(training)
+    names = transformer.get_feature_names_out()
+    lin_idx = list(names).index("main_linear__lin1")
+    lin_col = matrix[:, lin_idx]
+
+    # Verify median imputation happened before scaling and mean ~ 0, std ~ 1
+    imputed_expected = np.array([10.0, 20.0, 30.0, 25.0, 50.0])
+    mean_exp = np.mean(imputed_expected)
+    std_exp = np.std(imputed_expected)
+    expected_scaled = (imputed_expected - mean_exp) / std_exp
+
+    np.testing.assert_allclose(lin_col, expected_scaled, atol=1e-10)
+    assert np.isfinite(matrix).all()
+
+    # Transform-time data uses training scaler
+    test_data = pd.DataFrame(
+        {
+            "lin1": [25.0],
+            "smooth1": [3.0],
+        }
+    )
+    test_matrix = transformer.transform(test_data)
+    test_lin_val = test_matrix[0, lin_idx]
+    expected_test_val = (25.0 - mean_exp) / std_exp
+    np.testing.assert_allclose(test_lin_val, expected_test_val, atol=1e-10)
+
+    # Serialization preserves identical output
+    path = tmp_path / "linear_transformer.joblib"
+    joblib.dump(transformer, path)
+    loaded = joblib.load(path)
+    loaded_matrix = loaded.transform(training)
+    np.testing.assert_allclose(matrix, loaded_matrix, atol=1e-12)
+
+
 def test_undeclared_category_rejected() -> None:
     training = pd.DataFrame(
         {

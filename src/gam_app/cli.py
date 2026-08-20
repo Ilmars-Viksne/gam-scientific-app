@@ -15,6 +15,8 @@ from .config import load_config
 from .data import infer_role, load_table, profile_data, save_profile
 from .inspection import inspect_model, verify_link
 from .io_utils import read_json, write_yaml_atomic
+from .reporting import create_reports
+from .run_store import FileRunStore
 from .workflow import create_run, execute_run
 
 
@@ -228,7 +230,11 @@ def command_inspect(args) -> None:
     model = args.run / "models" / args.model / "model.joblib"
     output = args.run / "results" / args.model / "inspection"
     inspect_model(model, output, args.reference_class)
+    config = load_config(args.run / "config.yaml")
+    store = FileRunStore(args.run)
+    create_reports(config, store)
     print(f"Inspection written to {output.resolve()}")
+    print(f"HTML report regenerated at {(store.reports / 'report.html').resolve()}")
 
 
 def command_verify_link(args) -> None:
@@ -242,7 +248,10 @@ def command_verify_link(args) -> None:
     model = args.run / "models" / args.model / "model.joblib"
     output = args.run / "results" / args.model / "link_verification"
     error = verify_link(model, X, output)
+    store = FileRunStore(args.run)
+    create_reports(config, store)
     print(f"Maximum softmax reconstruction error: {error:.17g}")
+    print(f"HTML report regenerated at {(store.reports / 'report.html').resolve()}")
 
 
 def command_compare(args) -> None:
