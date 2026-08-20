@@ -104,7 +104,27 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
                 )
             )
 
-        labels = sorted(predictions["observed_class"].unique())
+        metadata_path = store.models / model.id / "model_metadata.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            labels = [str(value) for value in metadata.get("classes", [])]
+        else:
+            labels = []
+
+        prediction_labels = set(predictions["observed_class"].astype(str)) | set(
+            predictions["predicted_class"].astype(str)
+        )
+
+        if labels:
+            missing_labels = prediction_labels - set(labels)
+            if missing_labels:
+                raise ValueError(
+                    "Out-of-fold predictions contain classes that "
+                    "are absent from final-model metadata: "
+                    f"{sorted(missing_labels)}."
+                )
+        else:
+            labels = sorted(prediction_labels)
 
         raw_matrix = confusion_matrix(
             predictions.observed_class, predictions.predicted_class, labels=labels
