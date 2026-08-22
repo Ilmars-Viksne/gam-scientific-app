@@ -609,6 +609,238 @@ def command_predict(args) -> None:
     print(f"Results written to: {output_path.resolve()}")
 
 
+def command_transform(args) -> None:
+    """Export the fitted GAM design matrix for input scenarios."""
+
+    model_path = Path(args.model)
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model file does not exist: {model_path}")
+
+    if not input_path.is_file():
+        raise FileNotFoundError(
+            f"Transformation input file does not exist: {input_path}"
+        )
+
+    model = joblib.load(model_path)
+
+    if not hasattr(model, "named_steps"):
+        raise ValueError("The loaded model is not a compatible fitted pipeline.")
+
+    if "features" not in model.named_steps:
+        raise ValueError("The loaded pipeline does not contain a 'features' step.")
+
+    transformer = model.named_steps["features"]
+
+    if not hasattr(
+        transformer,
+        "feature_names_in_",
+    ):
+        raise ValueError(
+            "The fitted feature transformer does not expose feature_names_in_."
+        )
+
+    if not hasattr(
+        transformer,
+        "get_feature_names_out",
+    ):
+        raise ValueError(
+            "The fitted feature transformer does not support get_feature_names_out()."
+        )
+
+    scenarios = pd.read_csv(input_path)
+
+    if scenarios.empty:
+        raise ValueError("The transformation input file contains no observations.")
+
+    if scenarios.columns.has_duplicates:
+        duplicate_columns = (
+            scenarios.columns[scenarios.columns.duplicated()].astype(str).tolist()
+        )
+
+        raise ValueError(
+            f"Transformation data contains duplicate column names: {duplicate_columns}."
+        )
+
+    required_columns = [str(value) for value in transformer.feature_names_in_]
+
+    required_column_set = set(required_columns)
+
+    input_column_set = {str(value) for value in scenarios.columns}
+
+    missing_columns = sorted(required_column_set - input_column_set)
+
+    if missing_columns:
+        raise ValueError(
+            f"Transformation data is missing required predictors: {missing_columns}."
+        )
+
+    extra_columns = [
+        str(column)
+        for column in scenarios.columns
+        if str(column) not in required_column_set
+    ]
+
+    if extra_columns:
+        print(
+            "Extra input columns will be preserved in the output "
+            "but excluded from GAM transformation: "
+            f"{extra_columns}",
+            flush=True,
+        )
+
+    model_scenarios = scenarios.loc[
+        :,
+        required_columns,
+    ].copy()
+
+    transformed_matrix = np.asarray(
+        transformer.transform(model_scenarios),
+        dtype=np.float64,
+    )
+
+    transformed_names = [str(value) for value in transformer.get_feature_names_out()]
+
+    expected_shape = (
+        len(model_scenarios),
+        len(transformed_names),
+    )
+
+    if transformed_matrix.shape != expected_shape:
+        raise ValueError(
+            "The transformed GAM matrix has an unexpected shape. "
+            f"Received {transformed_matrix.shape}; "
+            f"expected {expected_shape}."
+        )
+
+    if not np.isfinite(transformed_matrix).all():
+        raise ValueError("The transformed GAM matrix contains nonfinite values.")
+
+    if len(transformed_names) != len(set(transformed_names)):
+        duplicated_names = sorted(
+            {name for name in transformed_names if transformed_names.count(name) > 1}
+        )
+
+        raise ValueError(
+            f"The transformed GAM feature names are not unique: {duplicated_names}."
+        )
+
+    transformed = pd.DataFrame(
+        transformed_matrix,
+        columns=transformed_names,
+        index=scenarios.index,
+    )
+
+    metadata_columns = [
+        column for column in scenarios.columns if str(column) not in required_column_set
+    ]
+
+    results = scenarios.loc[
+        :,
+        metadata_columns,
+    ].copy()
+
+    if "scenario_id" not in results.columns:
+        results.insert(
+            0,
+            "scenario_id",
+            np.arange(
+                1,
+                len(results) + 1,
+                dtype=np.int64,
+            ),
+        )
+
+    results = pd.concat(
+        [
+            results.reset_index(drop=True),
+            transformed.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    results.to_csv(
+        output_path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.17g",
+    )
+
+    prefix_counts = {
+        "smooth_main_effects": sum(
+            name.startswith("main_spline__") for name in transformed_names
+        ),
+        "linear_main_effects": sum(
+            name.startswith("main_linear__") for name in transformed_names
+        ),
+        "categorical_main_effects": sum(
+            name.startswith("main_categorical__") for name in transformed_names
+        ),
+        "interaction_components": sum(
+            name.startswith("interaction__") for name in transformed_names
+        ),
+    }
+
+    terminal_columns = [
+        "scenario_id",
+        *metadata_columns,
+        *transformed_names,
+    ]
+
+    print()
+    print("Transformed GAM components")
+    print("==========================")
+
+    print(
+        results.loc[
+            :,
+            terminal_columns,
+        ].to_string(
+            index=False,
+            max_rows=20,
+            max_cols=20,
+            float_format=lambda value: f"{value:.8g}",
+        )
+    )
+
+    if len(results) > 20:
+        print(f"\nTerminal preview limited to 20 of {len(results)} scenarios.")
+
+    if len(terminal_columns) > 20:
+        print(
+            "Terminal preview limited to 20 columns. "
+            "The CSV contains every transformed component."
+        )
+
+    print()
+    print("Transformation summary")
+    print("======================")
+    print(f"Model: {model_path.resolve()}")
+    print(f"Input: {input_path.resolve()}")
+    print(f"Output: {output_path.resolve()}")
+    print(f"Scenarios transformed: {len(results)}")
+    print(f"Input predictor count: {len(required_columns)}")
+    print(f"Metadata columns preserved: {len(metadata_columns)}")
+    print(f"Transformed component count: {len(transformed_names)}")
+    print(f"Smooth main-effect components: {prefix_counts['smooth_main_effects']}")
+    print(f"Linear main-effect components: {prefix_counts['linear_main_effects']}")
+    print(
+        "Categorical main-effect components: "
+        f"{prefix_counts['categorical_main_effects']}"
+    )
+    print(f"Interaction components: {prefix_counts['interaction_components']}")
+
+    print()
+    print(f"Results written to: {output_path.resolve()}")
+
+
 def command_demo(args) -> None:
     rng = np.random.default_rng(args.seed)
     n = args.rows
@@ -699,6 +931,37 @@ def build_parser() -> argparse.ArgumentParser:
     predict.add_argument("--input", type=Path, required=True)
     predict.add_argument("--output", type=Path, required=True)
     predict.set_defaults(func=command_predict)
+
+    transform_parser = sub.add_parser(
+        "transform",
+        help=("Export the fitted GAM design matrix for predictor scenarios."),
+    )
+
+    transform_parser.add_argument(
+        "--model",
+        type=Path,
+        required=True,
+        help="Path to a fitted model.joblib file.",
+    )
+
+    transform_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="CSV file containing predictor scenarios.",
+    )
+
+    transform_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination CSV for transformed GAM components.",
+    )
+
+    transform_parser.set_defaults(
+        func=command_transform,
+    )
+
     demo = sub.add_parser("demo")
     demo.add_argument("--output", type=Path, required=True)
     demo.add_argument("--rows", type=int, default=300)
