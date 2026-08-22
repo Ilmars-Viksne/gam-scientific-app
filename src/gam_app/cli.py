@@ -277,23 +277,336 @@ def command_compare(args) -> None:
 
 
 def command_predict(args) -> None:
-    model = joblib.load(args.model)
-    frame = load_table(args.input)
+    """Generate detailed predictions for predictor scenarios."""
 
-    probabilities = model.predict_proba(frame)
-    classes = model.named_steps["classifier"].classes_
-
-    output = pd.DataFrame(
-        probabilities,
-        columns=[f"probability_{name}" for name in classes],
-    )
-    output["predicted_class"] = classes[np.argmax(probabilities, axis=1)]
-
+    model_path = Path(args.model)
+    input_path = Path(args.input)
     output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output.to_csv(output_path, index=False)
 
-    print(f"Predictions written to {output_path.resolve()}")
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model file does not exist: {model_path}")
+
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Prediction input file does not exist: {input_path}")
+
+    model = joblib.load(model_path)
+
+    if not hasattr(model, "named_steps"):
+        raise ValueError("The loaded model is not a compatible fitted pipeline.")
+
+    if "features" not in model.named_steps:
+        raise ValueError("The loaded pipeline does not contain a 'features' step.")
+
+    if "classifier" not in model.named_steps:
+        raise ValueError("The loaded pipeline does not contain a 'classifier' step.")
+
+    transformer = model.named_steps["features"]
+    classifier = model.named_steps["classifier"]
+
+    if not hasattr(transformer, "feature_names_in_"):
+        raise ValueError(
+            "The fitted feature transformer does not expose feature_names_in_."
+        )
+
+    if not hasattr(classifier, "classes_"):
+        raise ValueError("The fitted classifier does not expose target classes.")
+
+    scenarios = pd.read_csv(input_path)
+
+    if scenarios.empty:
+        raise ValueError("The prediction input file contains no observations.")
+
+    if scenarios.columns.has_duplicates:
+        duplicate_columns = (
+            scenarios.columns[scenarios.columns.duplicated()].astype(str).tolist()
+        )
+
+        raise ValueError(
+            f"Prediction data contains duplicate column names: {duplicate_columns}."
+        )
+
+    required_columns = [str(value) for value in transformer.feature_names_in_]
+
+    input_columns = {str(value) for value in scenarios.columns}
+
+    required_column_set = set(required_columns)
+
+    missing_columns = sorted(required_column_set - input_columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"Prediction data is missing required predictors: {missing_columns}."
+        )
+
+    extra_columns = sorted(input_columns - required_column_set)
+
+    if extra_columns:
+        print(
+            "Extra input columns will be preserved in the output "
+            "but excluded from model prediction: "
+            f"{extra_columns}",
+            flush=True,
+        )
+
+    original_scenarios = scenarios.copy()
+
+    model_scenarios = scenarios.loc[
+        :,
+        required_columns,
+    ].copy()
+
+    probabilities = np.asarray(
+        model.predict_proba(model_scenarios),
+        dtype=np.float64,
+    )
+
+    predicted_classes = np.asarray(
+        model.predict(model_scenarios),
+        dtype=object,
+    )
+
+    raw_scores = np.asarray(
+        model.decision_function(model_scenarios),
+        dtype=np.float64,
+    )
+
+    classes = [str(value) for value in classifier.classes_]
+
+    if len(classes) < 2:
+        raise ValueError("The classifier must contain at least two classes.")
+
+    if raw_scores.ndim == 1:
+        if len(classes) != 2:
+            raise ValueError(
+                "One-dimensional decision scores are valid only "
+                "for binary classification."
+            )
+
+        score_matrix = np.column_stack(
+            [
+                np.zeros_like(raw_scores),
+                raw_scores,
+            ]
+        )
+
+    elif raw_scores.ndim == 2:
+        score_matrix = raw_scores
+
+    else:
+        raise ValueError(
+            "The classifier returned decision scores with an "
+            f"unsupported shape: {raw_scores.shape}."
+        )
+
+    expected_output_shape = (
+        len(model_scenarios),
+        len(classes),
+    )
+
+    if probabilities.shape != expected_output_shape:
+        raise ValueError(
+            "The probability matrix has an unexpected shape. "
+            f"Received {probabilities.shape}; "
+            f"expected {expected_output_shape}."
+        )
+
+    if score_matrix.shape != expected_output_shape:
+        raise ValueError(
+            "The decision-score matrix has an unexpected shape. "
+            f"Received {score_matrix.shape}; "
+            f"expected {expected_output_shape}."
+        )
+
+    expected_prediction_shape = (len(model_scenarios),)
+
+    if predicted_classes.shape != expected_prediction_shape:
+        raise ValueError(
+            "The predicted-class array has an unexpected shape. "
+            f"Received {predicted_classes.shape}; "
+            f"expected {expected_prediction_shape}."
+        )
+
+    if not np.isfinite(probabilities).all():
+        raise ValueError("The predicted probabilities contain nonfinite values.")
+
+    if not np.isfinite(score_matrix).all():
+        raise ValueError("The decision scores contain nonfinite values.")
+
+    probability_bound_tolerance = 1e-12
+
+    if np.any(probabilities < -probability_bound_tolerance):
+        raise ValueError("The classifier returned negative probabilities.")
+
+    if np.any(probabilities > 1.0 + probability_bound_tolerance):
+        raise ValueError("The classifier returned probabilities greater than one.")
+
+    probability_sums = probabilities.sum(axis=1)
+
+    maximum_probability_sum_error = float(np.max(np.abs(probability_sums - 1.0)))
+
+    if maximum_probability_sum_error > 1e-10:
+        raise ValueError(
+            "Predicted probabilities do not sum to one within "
+            "the required tolerance. Maximum error: "
+            f"{maximum_probability_sum_error:.17g}."
+        )
+
+    results = original_scenarios.copy()
+
+    if "scenario_id" not in results.columns:
+        results.insert(
+            0,
+            "scenario_id",
+            np.arange(
+                1,
+                len(results) + 1,
+                dtype=np.int64,
+            ),
+        )
+
+    score_column_names: list[str] = []
+    probability_column_names: list[str] = []
+
+    for class_index, class_name in enumerate(classes):
+        column_name = f"score_{class_name}"
+
+        score_column_names.append(column_name)
+
+        results[column_name] = score_matrix[:, class_index]
+
+    for class_index, class_name in enumerate(classes):
+        column_name = f"probability_{class_name}"
+
+        probability_column_names.append(column_name)
+
+        results[column_name] = probabilities[:, class_index]
+
+    probability_order = np.argsort(
+        probabilities,
+        axis=1,
+    )
+
+    predicted_class_indices = probability_order[:, -1]
+
+    second_class_indices = probability_order[:, -2]
+
+    maximum_probabilities = probabilities[
+        np.arange(len(probabilities)),
+        predicted_class_indices,
+    ]
+
+    second_probabilities = probabilities[
+        np.arange(len(probabilities)),
+        second_class_indices,
+    ]
+
+    second_classes = np.asarray(
+        classes,
+        dtype=object,
+    )[second_class_indices]
+
+    confidence_margin = maximum_probabilities - second_probabilities
+
+    safe_probabilities = np.clip(
+        probabilities,
+        np.finfo(np.float64).tiny,
+        1.0,
+    )
+
+    prediction_entropy = -np.sum(
+        safe_probabilities * np.log(safe_probabilities),
+        axis=1,
+    )
+
+    normalized_entropy = prediction_entropy / np.log(len(classes))
+
+    results["predicted_class"] = [str(value) for value in predicted_classes]
+
+    results["maximum_probability"] = maximum_probabilities
+
+    results["second_highest_class"] = [str(value) for value in second_classes]
+
+    results["second_highest_probability"] = second_probabilities
+
+    results["confidence_margin"] = confidence_margin
+
+    results["prediction_entropy"] = prediction_entropy
+
+    results["normalized_entropy"] = normalized_entropy
+
+    results["probability_sum"] = probability_sums
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    results.to_csv(
+        output_path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.17g",
+    )
+
+    terminal_columns = [
+        "scenario_id",
+        *score_column_names,
+        *probability_column_names,
+        "predicted_class",
+        "maximum_probability",
+        "second_highest_class",
+        "second_highest_probability",
+        "confidence_margin",
+        "prediction_entropy",
+        "normalized_entropy",
+        "probability_sum",
+    ]
+
+    print()
+    print("Prediction results")
+    print("==================")
+
+    print(
+        results.loc[
+            :,
+            terminal_columns,
+        ].to_string(
+            index=False,
+            max_rows=None,
+            max_cols=None,
+            float_format=lambda value: f"{value:.8g}",
+        )
+    )
+
+    print()
+    print("Prediction summary")
+    print("==================")
+    print(f"Model: {model_path.resolve()}")
+    print(f"Input: {input_path.resolve()}")
+    print(f"Output: {output_path.resolve()}")
+    print(f"Scenarios processed: {len(results)}")
+    print(f"Predictor count: {len(required_columns)}")
+    print(f"Extra columns preserved: {len(extra_columns)}")
+    print(f"Target class count: {len(classes)}")
+    print(f"Target classes: {classes}")
+    print(f"Maximum probability-sum error: {maximum_probability_sum_error:.17g}")
+
+    print()
+    print("Predicted class counts")
+    print("======================")
+
+    print(
+        results["predicted_class"]
+        .value_counts()
+        .reindex(
+            classes,
+            fill_value=0,
+        )
+        .to_string()
+    )
+
+    print()
+    print(f"Results written to: {output_path.resolve()}")
 
 
 def command_demo(args) -> None:
