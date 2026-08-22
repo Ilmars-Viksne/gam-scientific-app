@@ -1582,6 +1582,47 @@ def build_parser() -> argparse.ArgumentParser:
         func=command_transform,
     )
 
+    contributions_parser = sub.add_parser(
+        "contributions",
+        help=("Export transformed-component contributions to every class score."),
+    )
+
+    contributions_parser.add_argument(
+        "--model",
+        type=Path,
+        required=True,
+        help="Path to a fitted model.joblib file.",
+    )
+
+    contributions_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="CSV file containing predictor scenarios.",
+    )
+
+    contributions_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination CSV for component contributions.",
+    )
+
+    contributions_parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help=(
+            "Number of largest absolute contributions to display "
+            "per scenario and class. The output CSV always contains "
+            "all components."
+        ),
+    )
+
+    contributions_parser.set_defaults(
+        func=command_contributions,
+    )
+
     demo = sub.add_parser("demo")
     demo.add_argument("--output", type=Path, required=True)
     demo.add_argument("--rows", type=int, default=300)
