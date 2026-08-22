@@ -15,6 +15,7 @@ from .config import load_config
 from .data import infer_role, load_table, profile_data, save_profile
 from .inspection import inspect_model, verify_link
 from .io_utils import read_json, write_yaml_atomic
+from .logistic import extract_class_score_parameters
 from .reporting import create_reports
 from .run_store import FileRunStore
 from .workflow import create_run, execute_run
@@ -274,6 +275,62 @@ def command_compare(args) -> None:
         ["mean", "std", "median"]
     ).T.to_csv(args.output / "summary.csv")
     print((args.output / "summary.csv").read_text(encoding="utf-8"))
+
+
+def _component_type(
+    component_name: str,
+) -> str:
+    """Classify a transformed GAM component."""
+
+    if component_name.startswith("main_spline__"):
+        return "smooth"
+
+    if component_name.startswith("main_linear__"):
+        return "linear"
+
+    if component_name.startswith("main_categorical__"):
+        return "categorical"
+
+    if component_name.startswith("interaction__"):
+        return "interaction"
+
+    if component_name == "intercept":
+        return "intercept"
+
+    return "other"
+
+
+def _component_group(
+    component_name: str,
+) -> str:
+    """Return the predictor-level group for a GAM component."""
+
+    if component_name == "intercept":
+        return "intercept"
+
+    if component_name.startswith("main_spline__"):
+        remainder = component_name.removeprefix("main_spline__")
+
+        return remainder.split(
+            "__basis_",
+            maxsplit=1,
+        )[0]
+
+    if component_name.startswith("main_linear__"):
+        return component_name.removeprefix("main_linear__")
+
+    if component_name.startswith("main_categorical__"):
+        return component_name.removeprefix("main_categorical__")
+
+    if component_name.startswith("interaction__"):
+        remainder = component_name.removeprefix("interaction__")
+
+        return remainder.split(
+            "__basis_",
+            maxsplit=1,
+        )[0]
+
+    return component_name
 
 
 def command_predict(args) -> None:
@@ -839,6 +896,569 @@ def command_transform(args) -> None:
 
     print()
     print(f"Results written to: {output_path.resolve()}")
+
+
+def command_contributions(args) -> None:
+    """Export transformed-component contributions to class scores."""
+
+    model_path = Path(args.model)
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    top = int(args.top)
+
+    if top < 1:
+        raise ValueError("--top must be at least 1.")
+
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model file does not exist: {model_path}")
+
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Contribution input file does not exist: {input_path}")
+
+    model = joblib.load(model_path)
+
+    if not hasattr(model, "named_steps"):
+        raise ValueError("The loaded model is not a compatible fitted pipeline.")
+
+    if "features" not in model.named_steps:
+        raise ValueError("The loaded pipeline does not contain a 'features' step.")
+
+    if "classifier" not in model.named_steps:
+        raise ValueError("The loaded pipeline does not contain a 'classifier' step.")
+
+    transformer = model.named_steps["features"]
+    classifier = model.named_steps["classifier"]
+
+    if not hasattr(
+        transformer,
+        "feature_names_in_",
+    ):
+        raise ValueError(
+            "The fitted feature transformer does not expose feature_names_in_."
+        )
+
+    if not hasattr(
+        transformer,
+        "get_feature_names_out",
+    ):
+        raise ValueError(
+            "The fitted feature transformer does not expose get_feature_names_out()."
+        )
+
+    if not hasattr(classifier, "classes_"):
+        raise ValueError("The fitted classifier does not expose target classes.")
+
+    scenarios = pd.read_csv(input_path)
+
+    if scenarios.empty:
+        raise ValueError("The contribution input file contains no observations.")
+
+    if scenarios.columns.has_duplicates:
+        duplicate_columns = (
+            scenarios.columns[scenarios.columns.duplicated()].astype(str).tolist()
+        )
+
+        raise ValueError(
+            f"Contribution data contains duplicate column names: {duplicate_columns}."
+        )
+
+    required_columns = [str(value) for value in transformer.feature_names_in_]
+
+    required_column_set = set(required_columns)
+
+    input_column_set = {str(value) for value in scenarios.columns}
+
+    missing_columns = sorted(required_column_set - input_column_set)
+
+    if missing_columns:
+        raise ValueError(
+            f"Contribution data is missing required predictors: {missing_columns}."
+        )
+
+    metadata_columns = [
+        str(column)
+        for column in scenarios.columns
+        if str(column) not in required_column_set
+    ]
+
+    if metadata_columns:
+        print(
+            "Extra input columns will be preserved as scenario "
+            "metadata but excluded from model calculation: "
+            f"{metadata_columns}",
+            flush=True,
+        )
+
+    model_scenarios = scenarios.loc[
+        :,
+        required_columns,
+    ].copy()
+
+    transformed_matrix = np.asarray(
+        transformer.transform(model_scenarios),
+        dtype=np.float64,
+    )
+
+    transformed_names = [str(value) for value in transformer.get_feature_names_out()]
+
+    if len(transformed_names) != len(set(transformed_names)):
+        duplicate_names = sorted(
+            {name for name in transformed_names if transformed_names.count(name) > 1}
+        )
+
+        raise ValueError(
+            f"The transformed GAM feature names are not unique: {duplicate_names}."
+        )
+
+    expected_transformed_shape = (
+        len(model_scenarios),
+        len(transformed_names),
+    )
+
+    if transformed_matrix.shape != expected_transformed_shape:
+        raise ValueError(
+            "The transformed GAM matrix has an unexpected shape. "
+            f"Received {transformed_matrix.shape}; "
+            f"expected {expected_transformed_shape}."
+        )
+
+    if not np.isfinite(transformed_matrix).all():
+        raise ValueError("The transformed GAM matrix contains nonfinite values.")
+
+    parameters = extract_class_score_parameters(classifier)
+
+    classes = [str(value) for value in parameters.classes]
+
+    if len(classes) < 2:
+        raise ValueError("The classifier must contain at least two classes.")
+
+    coefficients = np.asarray(
+        parameters.coefficients,
+        dtype=np.float64,
+    )
+
+    intercepts = np.asarray(
+        parameters.intercepts,
+        dtype=np.float64,
+    )
+
+    expected_coefficient_shape = (
+        len(classes),
+        len(transformed_names),
+    )
+
+    if coefficients.shape != expected_coefficient_shape:
+        raise ValueError(
+            "The coefficient matrix has an unexpected shape. "
+            f"Received {coefficients.shape}; "
+            f"expected {expected_coefficient_shape}."
+        )
+
+    expected_intercept_shape = (len(classes),)
+
+    if intercepts.shape != expected_intercept_shape:
+        raise ValueError(
+            "The intercept array has an unexpected shape. "
+            f"Received {intercepts.shape}; "
+            f"expected {expected_intercept_shape}."
+        )
+
+    if not np.isfinite(coefficients).all():
+        raise ValueError("The coefficient matrix contains nonfinite values.")
+
+    if not np.isfinite(intercepts).all():
+        raise ValueError("The intercept array contains nonfinite values.")
+
+    probabilities = np.asarray(
+        model.predict_proba(model_scenarios),
+        dtype=np.float64,
+    )
+
+    predicted_classes = np.asarray(
+        model.predict(model_scenarios),
+        dtype=object,
+    )
+
+    expected_output_shape = (
+        len(model_scenarios),
+        len(classes),
+    )
+
+    if probabilities.shape != expected_output_shape:
+        raise ValueError(
+            "The probability matrix has an unexpected shape. "
+            f"Received {probabilities.shape}; "
+            f"expected {expected_output_shape}."
+        )
+
+    expected_prediction_shape = (len(model_scenarios),)
+
+    if predicted_classes.shape != expected_prediction_shape:
+        raise ValueError(
+            "The predicted-class array has an unexpected shape. "
+            f"Received {predicted_classes.shape}; "
+            f"expected {expected_prediction_shape}."
+        )
+
+    if not np.isfinite(probabilities).all():
+        raise ValueError("The predicted probabilities contain nonfinite values.")
+
+    score_matrix = transformed_matrix @ coefficients.T + intercepts
+
+    if score_matrix.shape != expected_output_shape:
+        raise ValueError(
+            "The reconstructed class-score matrix has an "
+            "unexpected shape. "
+            f"Received {score_matrix.shape}; "
+            f"expected {expected_output_shape}."
+        )
+
+    if not np.isfinite(score_matrix).all():
+        raise ValueError("The reconstructed class scores contain nonfinite values.")
+
+    raw_scores = np.asarray(
+        model.decision_function(model_scenarios),
+        dtype=np.float64,
+    )
+
+    if raw_scores.ndim == 1:
+        if len(classes) != 2:
+            raise ValueError(
+                "One-dimensional decision scores are valid only "
+                "for binary classification."
+            )
+
+        expected_scores = np.column_stack(
+            [
+                np.zeros_like(raw_scores),
+                raw_scores,
+            ]
+        )
+
+    elif raw_scores.ndim == 2:
+        expected_scores = raw_scores
+
+    else:
+        raise ValueError(
+            "The classifier returned decision scores with an "
+            f"unsupported shape: {raw_scores.shape}."
+        )
+
+    if expected_scores.shape != expected_output_shape:
+        raise ValueError(
+            "The fitted classifier score matrix has an unexpected "
+            "shape. "
+            f"Received {expected_scores.shape}; "
+            f"expected {expected_output_shape}."
+        )
+
+    maximum_score_error = float(np.max(np.abs(score_matrix - expected_scores)))
+
+    score_tolerance = 1e-10
+
+    if maximum_score_error > score_tolerance:
+        raise ValueError(
+            "Reconstructed class scores do not match the fitted "
+            "classifier. Maximum error: "
+            f"{maximum_score_error:.17g}."
+        )
+
+    if "scenario_id" in scenarios.columns:
+        scenario_ids = scenarios["scenario_id"].copy()
+    else:
+        scenario_ids = pd.Series(
+            np.arange(
+                1,
+                len(scenarios) + 1,
+                dtype=np.int64,
+            ),
+            index=scenarios.index,
+            name="scenario_id",
+        )
+
+    metadata_frame = scenarios.loc[
+        :,
+        metadata_columns,
+    ].copy()
+
+    if "scenario_id" not in metadata_frame.columns:
+        metadata_frame.insert(
+            0,
+            "scenario_id",
+            scenario_ids.to_numpy(),
+        )
+
+    rows: list[dict[str, object]] = []
+
+    for observation_index in range(len(model_scenarios)):
+        scenario_id = scenario_ids.iloc[observation_index]
+
+        predicted_class = str(predicted_classes[observation_index])
+
+        transformed_values = transformed_matrix[observation_index]
+
+        for class_index, class_name in enumerate(classes):
+            class_probability = float(
+                probabilities[
+                    observation_index,
+                    class_index,
+                ]
+            )
+
+            class_score = float(
+                score_matrix[
+                    observation_index,
+                    class_index,
+                ]
+            )
+
+            intercept = float(intercepts[class_index])
+
+            rows.append(
+                {
+                    "scenario_id": scenario_id,
+                    "observation_index": (observation_index),
+                    "class": class_name,
+                    "predicted_class": predicted_class,
+                    "class_probability": class_probability,
+                    "class_score": class_score,
+                    "component": "intercept",
+                    "component_type": "intercept",
+                    "component_group": "intercept",
+                    "transformed_value": 1.0,
+                    "coefficient": intercept,
+                    "contribution": intercept,
+                    "absolute_contribution": abs(intercept),
+                }
+            )
+
+            class_coefficients = coefficients[class_index]
+
+            contributions = transformed_values * class_coefficients
+
+            for (
+                transformed_name,
+                transformed_value,
+                coefficient,
+                contribution,
+            ) in zip(
+                transformed_names,
+                transformed_values,
+                class_coefficients,
+                contributions,
+                strict=True,
+            ):
+                rows.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "observation_index": (observation_index),
+                        "class": class_name,
+                        "predicted_class": (predicted_class),
+                        "class_probability": (class_probability),
+                        "class_score": class_score,
+                        "component": transformed_name,
+                        "component_type": (_component_type(transformed_name)),
+                        "component_group": (_component_group(transformed_name)),
+                        "transformed_value": float(transformed_value),
+                        "coefficient": float(coefficient),
+                        "contribution": float(contribution),
+                        "absolute_contribution": float(abs(contribution)),
+                    }
+                )
+
+    results = pd.DataFrame(
+        rows,
+        columns=[
+            "scenario_id",
+            "observation_index",
+            "class",
+            "predicted_class",
+            "class_probability",
+            "class_score",
+            "component",
+            "component_type",
+            "component_group",
+            "transformed_value",
+            "coefficient",
+            "contribution",
+            "absolute_contribution",
+        ],
+    )
+
+    contribution_sums = (
+        results.groupby(
+            [
+                "scenario_id",
+                "class",
+            ],
+            sort=False,
+        )["contribution"]
+        .sum()
+        .rename("reconstructed_score")
+        .reset_index()
+    )
+
+    score_summary_rows: list[dict[str, object]] = []
+
+    for observation_index in range(len(model_scenarios)):
+        scenario_id = scenario_ids.iloc[observation_index]
+
+        predicted_class = str(predicted_classes[observation_index])
+
+        for class_index, class_name in enumerate(classes):
+            score_summary_rows.append(
+                {
+                    "scenario_id": scenario_id,
+                    "observation_index": (observation_index),
+                    "class": class_name,
+                    "predicted_class": (predicted_class),
+                    "class_probability": float(
+                        probabilities[
+                            observation_index,
+                            class_index,
+                        ]
+                    ),
+                    "expected_score": float(
+                        expected_scores[
+                            observation_index,
+                            class_index,
+                        ]
+                    ),
+                }
+            )
+
+    score_summary = pd.DataFrame(score_summary_rows)
+
+    contribution_sums = contribution_sums.merge(
+        score_summary,
+        on=[
+            "scenario_id",
+            "class",
+        ],
+        validate="one_to_one",
+    )
+
+    contribution_sums["absolute_score_error"] = np.abs(
+        contribution_sums["reconstructed_score"] - contribution_sums["expected_score"]
+    )
+
+    maximum_contribution_sum_error = float(
+        contribution_sums["absolute_score_error"].max()
+    )
+
+    if maximum_contribution_sum_error > score_tolerance:
+        raise ValueError(
+            "Component contributions do not sum to the class "
+            "scores within the required tolerance. Maximum "
+            "error: "
+            f"{maximum_contribution_sum_error:.17g}."
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    results.to_csv(
+        output_path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.17g",
+    )
+
+    summary_path = output_path.with_name(f"{output_path.stem}_score_summary.csv")
+
+    contribution_sums.to_csv(
+        summary_path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.17g",
+    )
+
+    if metadata_columns:
+        metadata_path = output_path.with_name(
+            f"{output_path.stem}_scenario_metadata.csv"
+        )
+
+        metadata_frame.to_csv(
+            metadata_path,
+            index=False,
+            encoding="utf-8",
+        )
+    else:
+        metadata_path = None
+
+    terminal_results = (
+        results.sort_values(
+            [
+                "observation_index",
+                "class",
+                "absolute_contribution",
+            ],
+            ascending=[
+                True,
+                True,
+                False,
+            ],
+        )
+        .groupby(
+            [
+                "observation_index",
+                "class",
+            ],
+            sort=False,
+            group_keys=False,
+        )
+        .head(top)
+    )
+
+    terminal_columns = [
+        "scenario_id",
+        "class",
+        "predicted_class",
+        "class_probability",
+        "class_score",
+        "component",
+        "transformed_value",
+        "coefficient",
+        "contribution",
+        "absolute_contribution",
+    ]
+
+    print()
+    print("Largest class-score contributions")
+    print("=================================")
+
+    print(
+        terminal_results.loc[
+            :,
+            terminal_columns,
+        ].to_string(
+            index=False,
+            max_rows=None,
+            max_cols=None,
+            float_format=lambda value: f"{value:.8g}",
+        )
+    )
+
+    print()
+    print("Contribution summary")
+    print("====================")
+    print(f"Model: {model_path.resolve()}")
+    print(f"Input: {input_path.resolve()}")
+    print(f"Output: {output_path.resolve()}")
+    print(f"Score summary: {summary_path.resolve()}")
+
+    if metadata_path is not None:
+        print(f"Scenario metadata: {metadata_path.resolve()}")
+
+    print(f"Scenarios processed: {len(model_scenarios)}")
+    print(f"Target class count: {len(classes)}")
+    print(f"Target classes: {classes}")
+    print(f"Transformed component count: {len(transformed_names)}")
+    print(f"Contribution rows written: {len(results)}")
+    print(f"Maximum class-score reconstruction error: {maximum_score_error:.17g}")
+    print(f"Maximum contribution-sum error: {maximum_contribution_sum_error:.17g}")
 
 
 def command_demo(args) -> None:
