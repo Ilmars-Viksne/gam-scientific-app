@@ -1461,6 +1461,357 @@ def command_contributions(args) -> None:
     print(f"Maximum contribution-sum error: {maximum_contribution_sum_error:.17g}")
 
 
+def command_grouped_contributions(args) -> None:
+    """Aggregate component contributions by predictor group."""
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    top = int(args.top)
+
+    if top < 1:
+        raise ValueError("--top must be at least 1.")
+
+    if not input_path.is_file():
+        raise FileNotFoundError(
+            f"Component-contribution input file does not exist: {input_path}"
+        )
+
+    if not output_path.suffix:
+        output_path = output_path.with_suffix(".csv")
+    elif output_path.suffix.lower() != ".csv":
+        raise ValueError(
+            "The grouped-contribution output file must use the "
+            f"'.csv' extension: {output_path}"
+        )
+
+    frame = pd.read_csv(input_path)
+
+    if frame.empty:
+        raise ValueError("The component-contribution input file contains no rows.")
+
+    if frame.columns.has_duplicates:
+        duplicate_columns = (
+            frame.columns[frame.columns.duplicated()].astype(str).tolist()
+        )
+
+        raise ValueError(
+            "The component-contribution input contains duplicate "
+            f"column names: {duplicate_columns}."
+        )
+
+    required_columns = [
+        "scenario_id",
+        "observation_index",
+        "class",
+        "predicted_class",
+        "class_probability",
+        "class_score",
+        "component_type",
+        "component_group",
+        "contribution",
+    ]
+
+    missing_columns = sorted(set(required_columns) - set(frame.columns))
+
+    if missing_columns:
+        raise ValueError(
+            "The component-contribution input is missing required "
+            f"columns: {missing_columns}."
+        )
+
+    numeric_columns = [
+        "observation_index",
+        "class_probability",
+        "class_score",
+        "contribution",
+    ]
+
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        )
+
+    invalid_numeric_columns = [
+        column for column in numeric_columns if frame[column].isna().any()
+    ]
+
+    if invalid_numeric_columns:
+        raise ValueError(
+            "The component-contribution input contains missing or "
+            "nonnumeric values in required numeric columns: "
+            f"{invalid_numeric_columns}."
+        )
+
+    contribution_values = frame["contribution"].to_numpy(dtype=np.float64)
+
+    class_probability_values = frame["class_probability"].to_numpy(dtype=np.float64)
+
+    class_score_values = frame["class_score"].to_numpy(dtype=np.float64)
+
+    if not np.isfinite(contribution_values).all():
+        raise ValueError("Component contributions contain nonfinite values.")
+
+    if not np.isfinite(class_probability_values).all():
+        raise ValueError("Class probabilities contain nonfinite values.")
+
+    if not np.isfinite(class_score_values).all():
+        raise ValueError("Class scores contain nonfinite values.")
+
+    identity_columns = [
+        "scenario_id",
+        "observation_index",
+        "class",
+    ]
+
+    consistency_columns = [
+        "predicted_class",
+        "class_probability",
+        "class_score",
+    ]
+
+    consistency_counts = frame.groupby(
+        identity_columns,
+        sort=False,
+        dropna=False,
+    )[consistency_columns].nunique(dropna=False)
+
+    inconsistent_columns = [
+        column
+        for column in consistency_columns
+        if (consistency_counts[column] > 1).any()
+    ]
+
+    if inconsistent_columns:
+        raise ValueError(
+            "Scenario-class groups contain inconsistent repeated "
+            "values in columns: "
+            f"{inconsistent_columns}."
+        )
+
+    grouping_columns = [
+        "scenario_id",
+        "observation_index",
+        "class",
+        "predicted_class",
+        "class_probability",
+        "class_score",
+        "component_type",
+        "component_group",
+    ]
+
+    grouped = (
+        frame.groupby(
+            grouping_columns,
+            sort=False,
+            dropna=False,
+        )["contribution"]
+        .sum()
+        .rename("contribution")
+        .reset_index()
+    )
+
+    grouped["absolute_contribution"] = grouped["contribution"].abs()
+
+    grouped = grouped.sort_values(
+        [
+            "observation_index",
+            "class",
+            "absolute_contribution",
+            "component_type",
+            "component_group",
+        ],
+        ascending=[
+            True,
+            True,
+            False,
+            True,
+            True,
+        ],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    original_score_sums = (
+        frame.groupby(
+            identity_columns,
+            sort=False,
+            dropna=False,
+        )["contribution"]
+        .sum()
+        .rename("component_score")
+        .reset_index()
+    )
+
+    grouped_score_sums = (
+        grouped.groupby(
+            identity_columns,
+            sort=False,
+            dropna=False,
+        )["contribution"]
+        .sum()
+        .rename("grouped_score")
+        .reset_index()
+    )
+
+    expected_scores = (
+        frame.loc[
+            :,
+            [
+                *identity_columns,
+                "class_score",
+            ],
+        ]
+        .drop_duplicates(subset=identity_columns)
+        .reset_index(drop=True)
+    )
+
+    score_summary = expected_scores.merge(
+        original_score_sums,
+        on=identity_columns,
+        validate="one_to_one",
+    ).merge(
+        grouped_score_sums,
+        on=identity_columns,
+        validate="one_to_one",
+    )
+
+    score_summary["component_score_error"] = np.abs(
+        score_summary["component_score"] - score_summary["class_score"]
+    )
+
+    score_summary["grouped_score_error"] = np.abs(
+        score_summary["grouped_score"] - score_summary["class_score"]
+    )
+
+    score_summary["aggregation_error"] = np.abs(
+        score_summary["grouped_score"] - score_summary["component_score"]
+    )
+
+    maximum_component_score_error = float(score_summary["component_score_error"].max())
+
+    maximum_grouped_score_error = float(score_summary["grouped_score_error"].max())
+
+    maximum_aggregation_error = float(score_summary["aggregation_error"].max())
+
+    score_tolerance = 1e-10
+
+    if maximum_component_score_error > score_tolerance:
+        raise ValueError(
+            "The input component contributions do not reconstruct "
+            "the recorded class scores. Maximum error: "
+            f"{maximum_component_score_error:.17g}."
+        )
+
+    if maximum_grouped_score_error > score_tolerance:
+        raise ValueError(
+            "The grouped contributions do not reconstruct the "
+            "recorded class scores. Maximum error: "
+            f"{maximum_grouped_score_error:.17g}."
+        )
+
+    if maximum_aggregation_error > score_tolerance:
+        raise ValueError(
+            "Grouped contribution totals do not match the input "
+            "component-contribution totals. Maximum error: "
+            f"{maximum_aggregation_error:.17g}."
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    grouped.to_csv(
+        output_path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.17g",
+    )
+
+    summary_path = output_path.with_name(f"{output_path.stem}_score_summary.csv")
+
+    score_summary.to_csv(
+        summary_path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.17g",
+    )
+
+    terminal_results = (
+        grouped.sort_values(
+            [
+                "observation_index",
+                "class",
+                "absolute_contribution",
+            ],
+            ascending=[
+                True,
+                True,
+                False,
+            ],
+            kind="stable",
+        )
+        .groupby(
+            [
+                "observation_index",
+                "class",
+            ],
+            sort=False,
+            dropna=False,
+            group_keys=False,
+        )
+        .head(top)
+    )
+
+    terminal_columns = [
+        "scenario_id",
+        "class",
+        "predicted_class",
+        "class_probability",
+        "class_score",
+        "component_type",
+        "component_group",
+        "contribution",
+        "absolute_contribution",
+    ]
+
+    print()
+    print("Largest grouped class-score contributions")
+    print("=========================================")
+
+    print(
+        terminal_results.loc[
+            :,
+            terminal_columns,
+        ].to_string(
+            index=False,
+            max_rows=None,
+            max_cols=None,
+            float_format=lambda value: f"{value:.8g}",
+        )
+    )
+
+    print()
+    print("Grouped-contribution summary")
+    print("============================")
+    print(f"Input: {input_path.resolve()}")
+    print(f"Output: {output_path.resolve()}")
+    print(f"Score summary: {summary_path.resolve()}")
+    print(f"Component-contribution rows read: {len(frame)}")
+    print(f"Grouped-contribution rows written: {len(grouped)}")
+    print(f"Scenario-class combinations: {len(score_summary)}")
+    print(f"Component groups: {grouped['component_group'].nunique()}")
+    print(
+        "Maximum input score-reconstruction error: "
+        f"{maximum_component_score_error:.17g}"
+    )
+    print(
+        "Maximum grouped score-reconstruction error: "
+        f"{maximum_grouped_score_error:.17g}"
+    )
+    print(f"Maximum aggregation error: {maximum_aggregation_error:.17g}")
+
+
 def command_demo(args) -> None:
     rng = np.random.default_rng(args.seed)
     n = args.rows
@@ -1621,6 +1972,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     contributions_parser.set_defaults(
         func=command_contributions,
+    )
+
+    grouped_contributions_parser = sub.add_parser(
+        "grouped-contributions",
+        help=(
+            "Aggregate transformed-component contributions by "
+            "predictor or interaction group."
+        ),
+    )
+
+    grouped_contributions_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help=("CSV file produced by the contributions command."),
+    )
+
+    grouped_contributions_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help=("Destination CSV for grouped contributions."),
+    )
+
+    grouped_contributions_parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help=(
+            "Number of largest absolute grouped contributions to "
+            "display per scenario and class. The output CSV always "
+            "contains all groups."
+        ),
+    )
+
+    grouped_contributions_parser.set_defaults(
+        func=command_grouped_contributions,
     )
 
     demo = sub.add_parser("demo")
