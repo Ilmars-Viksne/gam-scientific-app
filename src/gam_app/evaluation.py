@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import json
 import shutil
+import time
 import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -627,22 +628,120 @@ def run_outer_folds_in_parallel(
                     submit_next(executor)
 
 
+def _commit_checkpoint_directory(
+    temporary: Path,
+    checkpoint: Path,
+    *,
+    attempts: int = 5,
+    initial_delay: float = 0.05,
+) -> None:
+    """Commit a completed temporary checkpoint directory.
+
+    Directory renames can temporarily fail on Windows when another
+    process, antivirus scanner, or file indexer briefly holds one of
+    the newly written files. Retry with a short exponential backoff.
+
+    If an atomic rename remains unavailable, fall back to shutil.move().
+    The COMPLETE marker still protects checkpoint validity.
+    """
+
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1.")
+
+    if not temporary.is_dir():
+        raise FileNotFoundError(
+            f"Temporary checkpoint directory does not exist: {temporary}"
+        )
+
+    if not (temporary / "COMPLETE").is_file():
+        raise RuntimeError(
+            "Temporary checkpoint cannot be committed because "
+            f"its COMPLETE marker is missing: {temporary}"
+        )
+
+    checkpoint.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if checkpoint.exists():
+        shutil.rmtree(
+            checkpoint,
+        )
+
+    delay = initial_delay
+    last_error: OSError | None = None
+
+    for attempt in range(
+        1,
+        attempts + 1,
+    ):
+        try:
+            # The destination has already been removed, so rename()
+            # expresses the intended operation more directly than
+            # replace() for a directory.
+            temporary.rename(checkpoint)
+            return
+
+        except PermissionError as error:
+            last_error = error
+
+        except OSError as error:
+            # On Windows, a transient sharing violation may be exposed
+            # as a general OSError rather than PermissionError.
+            last_error = error
+
+        if attempt < attempts:
+            time.sleep(delay)
+            delay *= 2.0
+
+    # Atomic directory renaming was unavailable. shutil.move() first
+    # attempts a rename and can fall back to copying and deleting.
+    try:
+        shutil.move(
+            str(temporary),
+            str(checkpoint),
+        )
+    except OSError as error:
+        if last_error is not None:
+            raise RuntimeError(
+                "Could not commit the completed checkpoint "
+                "directory after repeated Windows filesystem "
+                "retries. "
+                f"Temporary directory: {temporary}; "
+                f"destination: {checkpoint}."
+            ) from last_error
+
+        raise RuntimeError(
+            f"Could not commit the completed checkpoint directory: {checkpoint}."
+        ) from error
+
+    if not (checkpoint / "COMPLETE").is_file():
+        raise RuntimeError(
+            "The checkpoint directory was moved, but its COMPLETE "
+            f"marker is missing: {checkpoint}"
+        )
+
+
 def write_fold_checkpoint(
     result: OuterFoldResult,
     checkpoint: Path,
     data_hash: str,
     config_hash: str,
 ) -> None:
-    """Write one completed outer-fold checkpoint atomically."""
+    """Write and commit one complete outer-fold checkpoint."""
 
     temporary = checkpoint.with_name(f"{checkpoint.name}.tmp")
 
     if temporary.exists():
-        shutil.rmtree(temporary)
+        shutil.rmtree(
+            temporary,
+            ignore_errors=True,
+        )
 
     temporary.mkdir(
         parents=True,
-        exist_ok=True,
+        exist_ok=False,
     )
 
     try:
@@ -683,22 +782,21 @@ def write_fold_checkpoint(
             temporary / "model.joblib",
         )
 
+        # Write COMPLETE last. Its presence means every checkpoint
+        # artifact has been written successfully.
         (temporary / "COMPLETE").write_text(
             "completed\n",
             encoding="utf-8",
         )
 
-        checkpoint.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+        _commit_checkpoint_directory(
+            temporary=temporary,
+            checkpoint=checkpoint,
         )
 
-        if checkpoint.exists():
-            shutil.rmtree(checkpoint)
-
-        temporary.replace(checkpoint)
-
     except BaseException:
+        # If the temporary directory still exists, the commit did not
+        # complete. Remove it so a future retry starts cleanly.
         if temporary.exists():
             shutil.rmtree(
                 temporary,

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -279,3 +280,151 @@ def test_create_reports_generates_expected_outputs(
     # Check plot image generation
     assert (store.plots / f"{model_id}_confusion_matrix.png").exists()
     assert (store.plots / f"{model_id}_confusion_matrix_normalized.png").exists()
+
+
+def test_write_fold_checkpoint_commits_complete_directory(
+    test_experiment_config,
+    tmp_path: Path,
+) -> None:
+    store = FileRunStore(tmp_path / "run_dir")
+    store.initialize()
+
+    model = test_experiment_config.models[0]
+
+    result = OuterFoldResult(
+        model_id=model.id,
+        repeat=1,
+        fold=1,
+        metrics={
+            "model_id": model.id,
+            "repeat": 1,
+            "fold": 1,
+            "log_loss": 0.5,
+            "accuracy": 0.8,
+            "balanced_accuracy": 0.8,
+            "macro_f1": 0.8,
+            "macro_specificity": 0.8,
+            "weighted_specificity": 0.8,
+        },
+        class_metrics=pd.DataFrame(
+            {
+                "model_id": [
+                    model.id,
+                    model.id,
+                ],
+                "repeat": [
+                    1,
+                    1,
+                ],
+                "fold": [
+                    1,
+                    1,
+                ],
+                "class": [
+                    "A",
+                    "B",
+                ],
+                "true_negative": [
+                    5,
+                    6,
+                ],
+                "false_positive": [
+                    1,
+                    0,
+                ],
+                "false_negative": [
+                    1,
+                    1,
+                ],
+                "true_positive": [
+                    4,
+                    5,
+                ],
+                "sensitivity": [
+                    0.8,
+                    0.833,
+                ],
+                "specificity": [
+                    0.833,
+                    1.0,
+                ],
+                "precision": [
+                    0.8,
+                    1.0,
+                ],
+                "f1": [
+                    0.8,
+                    0.9,
+                ],
+                "support": [
+                    5,
+                    6,
+                ],
+            }
+        ),
+        trials=pd.DataFrame(
+            [
+                {
+                    "n_knots": 3,
+                    "degree": 2,
+                    "C": 1.0,
+                    "mean_log_loss": 0.5,
+                }
+            ]
+        ),
+        predictions=pd.DataFrame(
+            {
+                "model_id": [
+                    model.id,
+                    model.id,
+                ],
+                "repeat": [
+                    1,
+                    1,
+                ],
+                "fold": [
+                    1,
+                    1,
+                ],
+                "row_id": [
+                    "r1",
+                    "r2",
+                ],
+                "observed_class": [
+                    "A",
+                    "B",
+                ],
+                "predicted_class": [
+                    "A",
+                    "B",
+                ],
+            }
+        ),
+        fitted_model=MockPipeline(),
+    )
+
+    checkpoint = store.checkpoint_directory(
+        model.id,
+        1,
+        1,
+    )
+
+    write_fold_checkpoint(
+        result=result,
+        checkpoint=checkpoint,
+        data_hash="data-hash",
+        config_hash="config-hash",
+    )
+
+    assert checkpoint.is_dir()
+    assert (checkpoint / "COMPLETE").is_file()
+    assert (checkpoint / "checkpoint.json").is_file()
+    assert (checkpoint / "metrics.json").is_file()
+    assert (checkpoint / "class_metrics.parquet").is_file()
+    assert (checkpoint / "trials.parquet").is_file()
+    assert (checkpoint / "predictions.parquet").is_file()
+    assert (checkpoint / "model.joblib").is_file()
+
+    temporary = checkpoint.with_name(f"{checkpoint.name}.tmp")
+
+    assert not temporary.exists()
