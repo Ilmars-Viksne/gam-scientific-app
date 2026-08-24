@@ -49,6 +49,77 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
         sections.append("<h3>Class distribution</h3>")
         sections.append(dist_df.to_html(index=False))
 
+    diagnostics_dir = store.root / "diagnostics"
+    if diagnostics_dir.exists():
+        sections.append("<h2>Predictor diagnostics</h2>")
+
+        high_pairs_path = diagnostics_dir / "high_correlation_pairs.csv"
+        if high_pairs_path.exists():
+            high_pairs = pd.read_csv(high_pairs_path)
+            sections.append("<h3>High predictor correlations</h3>")
+            if high_pairs.empty:
+                sections.append(
+                    "<p>No predictor pairs exceeded the configured "
+                    "review threshold.</p>"
+                )
+            else:
+                display_columns = [
+                    "left",
+                    "right",
+                    "pearson",
+                    "spearman",
+                    "maximum_absolute_correlation",
+                    "severity",
+                    "declared_derivation_relation",
+                    "recommended_action",
+                ]
+                available_cols = [c for c in display_columns if c in high_pairs.columns]
+                sections.append(
+                    high_pairs.loc[:, available_cols].to_html(
+                        index=False,
+                        float_format=lambda value: f"{value:.4f}",
+                    )
+                )
+
+        sections.append(
+            "<p><em>High correlation identifies predictor redundancy "
+            "or shared structure. It is not an automatic predictor "
+            "deletion rule. Penalized prediction may remain stable while "
+            "individual term attribution is not unique.</em></p>"
+        )
+
+        exact_duplicates_path = diagnostics_dir / "exact_duplicate_groups.csv"
+        if exact_duplicates_path.exists():
+            exact_duplicates = pd.read_csv(exact_duplicates_path)
+            has_col = "duplicate_group_id" in exact_duplicates.columns
+            duplicate_group_count = (
+                exact_duplicates["duplicate_group_id"].nunique()
+                if not exact_duplicates.empty and has_col
+                else 0
+            )
+            sections.append("<h3>Duplicate predictor groups</h3>")
+            sections.append(f"<p>Exact duplicate groups: {duplicate_group_count}</p>")
+
+        diagnostic_links = [
+            '<li><a href="../diagnostics/correlation_pearson.csv">'
+            "Pearson correlation matrix</a></li>",
+            '<li><a href="../diagnostics/correlation_spearman.csv">'
+            "Spearman correlation matrix</a></li>",
+            '<li><a href="../diagnostics/high_correlation_pairs.csv">'
+            "High-correlation pair report</a></li>",
+            '<li><a href="../diagnostics/numeric_predictor_dictionary.csv">'
+            "Numeric predictor dictionary</a></li>",
+            '<li><a href="../diagnostics/exact_duplicate_groups.csv">'
+            "Exact duplicate groups</a></li>",
+            '<li><a href="../diagnostics/near_duplicate_groups.csv">'
+            "Candidate near-duplicate groups</a></li>",
+            '<li><a href="../diagnostics/conflicting_duplicate_targets.csv">'
+            "Conflicting duplicate targets</a></li>",
+            '<li><a href="../diagnostics/suspected_derived_relations.csv">'
+            "Suspected derived relations</a></li>",
+        ]
+        sections.append(f"<ul>{''.join(diagnostic_links)}</ul>")
+
     for model in config.models:
         result_dir = store.results / model.id
         summary = pd.read_csv(result_dir / "summary.csv", index_col=0)

@@ -115,6 +115,6 @@ def test_validate_training_data_valid_class_counts(tmp_path):
     )
     df.to_csv(cfg.data_path, index=False)
 
-    X, target, row_ids = validate_training_data(cfg)
-    assert len(X) == 30
-    assert len(target) == 30
+    ds = validate_training_data(cfg)
+    assert len(ds.X) == 30
+    assert len(ds.y) == 30

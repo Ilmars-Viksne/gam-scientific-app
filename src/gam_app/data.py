@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,16 @@ import pandas as pd
 from .config import ExperimentConfig
 from .exceptions import DataValidationError
 from .io_utils import sha256_file
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingDataset:
+    X: pd.DataFrame
+    y: pd.Series
+    row_ids: pd.Series
+    groups: pd.Series | None
+    times: pd.Series | None
+    source_frame: pd.DataFrame
 
 
 def load_table(path: Path) -> pd.DataFrame:
@@ -92,14 +103,25 @@ def profile_data(path: Path, target: str) -> dict[str, Any]:
 
 def validate_training_data(
     config: ExperimentConfig,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+) -> TrainingDataset:
     frame = load_table(config.data_path)
+
     required = [config.target, *config.features]
+    if config.row_id is not None:
+        required.append(config.row_id)
+    if config.group_column is not None:
+        required.append(config.group_column)
+    if config.time_column is not None:
+        required.append(config.time_column)
+
+    required = list(dict.fromkeys(required))
+
     missing_columns = sorted(set(required) - set(frame.columns))
     if missing_columns:
         raise DataValidationError(f"Missing configured columns: {missing_columns}")
     if frame.columns.duplicated().any():
         raise DataValidationError("Duplicate column names are not supported.")
+
     target = frame[config.target]
     if target.isna().any():
         raise DataValidationError("Missing target values are not supported.")
@@ -108,29 +130,30 @@ def validate_training_data(
             "Classification requires at least two target classes."
         )
 
-    class_counts = target.astype(str).value_counts()
-    smallest_class_count = int(class_counts.min())
+    # Validate target class counts only if strategy is stratified or stratified_group
+    if config.validation.strategy in {"stratified", "stratified_group"}:
+        class_counts = target.astype(str).value_counts()
+        smallest_class_count = int(class_counts.min())
 
-    outer_splits = config.validation.outer_splits
-    inner_splits = config.validation.inner_splits
+        outer_splits = config.validation.outer_splits
+        inner_splits = config.validation.inner_splits
 
-    if smallest_class_count < outer_splits:
-        raise DataValidationError(
-            "The least frequent target class contains "
-            f"{smallest_class_count} observations, but "
-            f"outer_splits={outer_splits}."
-        )
+        if smallest_class_count < outer_splits:
+            raise DataValidationError(
+                "The least frequent target class contains "
+                f"{smallest_class_count} observations, but "
+                f"outer_splits={outer_splits}."
+            )
 
-    largest_outer_test_count = int(np.ceil(smallest_class_count / outer_splits))
+        largest_outer_test_count = int(np.ceil(smallest_class_count / outer_splits))
+        smallest_outer_train_count = smallest_class_count - largest_outer_test_count
 
-    smallest_outer_train_count = smallest_class_count - largest_outer_test_count
-
-    if smallest_outer_train_count < inner_splits:
-        raise DataValidationError(
-            "The least frequent target class may contain only "
-            f"{smallest_outer_train_count} observations in an "
-            f"outer training partition, but inner_splits={inner_splits}."
-        )
+        if smallest_outer_train_count < inner_splits:
+            raise DataValidationError(
+                "The least frequent target class may contain only "
+                f"{smallest_outer_train_count} observations in an "
+                f"outer training partition, but inner_splits={inner_splits}."
+            )
 
     active = [name for name, spec in config.features.items() if spec.role != "exclude"]
     X = frame.loc[:, active].copy()
@@ -144,13 +167,51 @@ def validate_training_data(
                 raise DataValidationError(f"Feature {name!r} is not fully numeric.")
         elif spec.role == "categorical":
             X[name] = X[name].astype("string")
+
     if config.row_id:
         row_ids = frame[config.row_id].astype(str)
         if row_ids.duplicated().any():
             raise DataValidationError("Configured row_id must be unique.")
     else:
         row_ids = pd.Series(np.arange(1, len(frame) + 1).astype(str), name="row_id")
-    return X, target.astype(str), row_ids
+
+    groups: pd.Series | None = None
+    if config.group_column is not None:
+        groups_series = frame[config.group_column]
+        if groups_series.isna().any():
+            raise DataValidationError(
+                f"Configured group column {config.group_column!r} "
+                "contains missing values."
+            )
+        groups = groups_series.astype(str).rename("group")
+
+    times: pd.Series | None = None
+    if config.time_column is not None:
+        parsed_times = pd.to_datetime(
+            frame[config.time_column],
+            errors="coerce",
+            utc=True,
+        )
+        if parsed_times.isna().any():
+            invalid_count = int(parsed_times.isna().sum())
+            raise DataValidationError(
+                f"Configured time column {config.time_column!r} "
+                f"contains {invalid_count} missing or invalid timestamps."
+            )
+        times = pd.Series(
+            parsed_times,
+            index=frame.index,
+            name="time",
+        )
+
+    return TrainingDataset(
+        X=X.reset_index(drop=True),
+        y=target.astype(str).reset_index(drop=True),
+        row_ids=row_ids.reset_index(drop=True),
+        groups=groups.reset_index(drop=True) if groups is not None else None,
+        times=times.reset_index(drop=True) if times is not None else None,
+        source_frame=frame.reset_index(drop=True),
+    )
 
 
 def save_profile(profile: dict[str, Any], directory: Path) -> None:
