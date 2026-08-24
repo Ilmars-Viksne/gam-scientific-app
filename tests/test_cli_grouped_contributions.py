@@ -305,6 +305,27 @@ def test_grouped_contributions_parser_registration() -> None:
     assert args.input == Path("component_contributions.csv")
     assert args.output == Path("grouped_contributions.csv")
     assert args.top == 10
+    assert args.reference_class is None
+
+
+def test_grouped_contributions_parser_accepts_reference_class() -> None:
+    """An explicit reference class option should be accepted."""
+
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "grouped-contributions",
+            "--input",
+            "components.csv",
+            "--output",
+            "grouped.csv",
+            "--reference-class",
+            "Other_Faults",
+        ]
+    )
+
+    assert args.reference_class == "Other_Faults"
 
 
 def test_grouped_contributions_parser_accepts_top() -> None:
@@ -375,6 +396,7 @@ def test_grouped_contributions_aggregates_basis_terms(
             input=input_path,
             output=output_path,
             top=10,
+            reference_class=None,
         )
     )
 
@@ -444,6 +466,7 @@ def test_grouped_contributions_preserves_intercepts(
             input=input_path,
             output=output_path,
             top=10,
+            reference_class=None,
         )
     )
 
@@ -591,12 +614,20 @@ def test_grouped_contributions_writes_score_summary(
         "scenario_id",
         "observation_index",
         "class",
+        "predicted_class",
+        "class_probability",
         "class_score",
-        "component_score",
-        "grouped_score",
-        "component_score_error",
-        "grouped_score_error",
-        "aggregation_error",
+        "reconstructed_raw_score",
+        "raw_score_error",
+        "class_mean_score",
+        "centered_class_score",
+        "reconstructed_centered_score",
+        "centered_score_error",
+        "reference_class",
+        "reference_score",
+        "score_contrast",
+        "reconstructed_score_contrast",
+        "contrast_score_error",
     }
 
     assert expected_columns.issubset(summary.columns)
@@ -604,21 +635,14 @@ def test_grouped_contributions_writes_score_summary(
     assert len(summary) == 4
 
     np.testing.assert_allclose(
-        summary["component_score_error"].to_numpy(dtype=np.float64),
+        summary["raw_score_error"].to_numpy(dtype=np.float64),
         0.0,
         rtol=0.0,
         atol=1e-12,
     )
 
     np.testing.assert_allclose(
-        summary["grouped_score_error"].to_numpy(dtype=np.float64),
-        0.0,
-        rtol=0.0,
-        atol=1e-12,
-    )
-
-    np.testing.assert_allclose(
-        summary["aggregation_error"].to_numpy(dtype=np.float64),
+        summary["centered_score_error"].to_numpy(dtype=np.float64),
         0.0,
         rtol=0.0,
         atol=1e-12,
@@ -647,6 +671,7 @@ def test_grouped_contributions_adds_csv_extension(
             input=input_path,
             output=output_without_suffix,
             top=10,
+            reference_class=None,
         )
     )
 
@@ -673,6 +698,7 @@ def test_grouped_contributions_rejects_non_csv_output(
                 input=input_path,
                 output=(tmp_path / "grouped_contributions.xlsx"),
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -693,6 +719,7 @@ def test_grouped_contributions_rejects_missing_input(
                 input=missing_path,
                 output=(tmp_path / "grouped.csv"),
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -732,6 +759,7 @@ def test_grouped_contributions_rejects_empty_input(
                 input=input_path,
                 output=output_path,
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -771,6 +799,7 @@ def test_grouped_contributions_rejects_missing_columns(
                 input=input_path,
                 output=output_path,
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -793,6 +822,7 @@ def test_grouped_contributions_rejects_invalid_top(
                 input=input_path,
                 output=(tmp_path / "grouped.csv"),
                 top=0,
+                reference_class=None,
             )
         )
 
@@ -829,6 +859,7 @@ def test_grouped_contributions_rejects_nonnumeric_values(
                 input=input_path,
                 output=output_path,
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -863,6 +894,7 @@ def test_grouped_contributions_rejects_nonfinite_values(
                 input=input_path,
                 output=output_path,
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -897,6 +929,7 @@ def test_grouped_contributions_rejects_inconsistent_scores(
                 input=input_path,
                 output=output_path,
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -936,6 +969,7 @@ def test_grouped_contributions_rejects_invalid_score_sum(
                 input=input_path,
                 output=output_path,
                 top=10,
+                reference_class=None,
             )
         )
 
@@ -957,6 +991,7 @@ def test_top_limits_preview_but_not_output(
             input=input_path,
             output=output_path,
             top=1,
+            reference_class=None,
         )
     )
 
@@ -971,3 +1006,243 @@ def test_top_limits_preview_but_not_output(
     assert "Grouped-contribution summary" in captured.out
 
     assert str(output_path.resolve()) in captured.out
+
+
+def test_class_centered_contributions_sum_to_zero(
+    tmp_path: Path,
+) -> None:
+    """Class-centered contributions must sum to zero across classes."""
+
+    input_path = tmp_path / "component_contributions.csv"
+
+    output_path = tmp_path / "grouped_centered.csv"
+
+    _write_component_contributions(input_path)
+
+    command_grouped_contributions(
+        Namespace(
+            input=input_path,
+            output=output_path,
+            top=10,
+            reference_class=None,
+        )
+    )
+
+    grouped = pd.read_csv(output_path)
+
+    centered_sums = (
+        grouped.groupby(
+            [
+                "scenario_id",
+                "observation_index",
+                "component_type",
+                "component_group",
+            ],
+            dropna=False,
+        )["centered_contribution"]
+        .sum()
+        .to_numpy(dtype=np.float64)
+    )
+
+    np.testing.assert_allclose(
+        centered_sums,
+        0.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_centered_contributions_reconstruct_centered_scores(
+    tmp_path: Path,
+) -> None:
+    """Centered contributions must reconstruct centered class scores."""
+
+    input_path = tmp_path / "component_contributions.csv"
+
+    output_path = tmp_path / "grouped_centered.csv"
+
+    _write_component_contributions(input_path)
+
+    command_grouped_contributions(
+        Namespace(
+            input=input_path,
+            output=output_path,
+            top=10,
+            reference_class=None,
+        )
+    )
+
+    grouped = pd.read_csv(output_path)
+
+    reconstructed = (
+        grouped.groupby(
+            [
+                "scenario_id",
+                "class",
+            ],
+            sort=False,
+        )["centered_contribution"]
+        .sum()
+        .rename("reconstructed")
+        .reset_index()
+    )
+
+    expected = grouped.loc[
+        :,
+        [
+            "scenario_id",
+            "class",
+            "centered_class_score",
+        ],
+    ].drop_duplicates(
+        subset=[
+            "scenario_id",
+            "class",
+        ]
+    )
+
+    verification = expected.merge(
+        reconstructed,
+        on=[
+            "scenario_id",
+            "class",
+        ],
+        validate="one_to_one",
+    )
+
+    np.testing.assert_allclose(
+        verification["reconstructed"].to_numpy(dtype=np.float64),
+        verification["centered_class_score"].to_numpy(dtype=np.float64),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_reference_contributions_reconstruct_score_contrasts(
+    tmp_path: Path,
+) -> None:
+    """Reference contrasts must reconstruct score contrasts."""
+
+    input_path = tmp_path / "component_contributions.csv"
+
+    output_path = tmp_path / "grouped_reference.csv"
+
+    _write_component_contributions(input_path)
+
+    command_grouped_contributions(
+        Namespace(
+            input=input_path,
+            output=output_path,
+            top=10,
+            reference_class="A",
+        )
+    )
+
+    grouped = pd.read_csv(output_path)
+
+    reconstructed = (
+        grouped.groupby(
+            [
+                "scenario_id",
+                "class",
+            ],
+            sort=False,
+        )["contrast_contribution"]
+        .sum()
+        .rename("reconstructed")
+        .reset_index()
+    )
+
+    expected = grouped.loc[
+        :,
+        [
+            "scenario_id",
+            "class",
+            "score_contrast",
+        ],
+    ].drop_duplicates(
+        subset=[
+            "scenario_id",
+            "class",
+        ]
+    )
+
+    verification = expected.merge(
+        reconstructed,
+        on=[
+            "scenario_id",
+            "class",
+        ],
+        validate="one_to_one",
+    )
+
+    np.testing.assert_allclose(
+        verification["reconstructed"].to_numpy(dtype=np.float64),
+        verification["score_contrast"].to_numpy(dtype=np.float64),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_reference_class_contrasts_are_zero(
+    tmp_path: Path,
+) -> None:
+    """The reference class itself should have zero contrasts."""
+
+    input_path = tmp_path / "component_contributions.csv"
+
+    output_path = tmp_path / "grouped_reference.csv"
+
+    _write_component_contributions(input_path)
+
+    command_grouped_contributions(
+        Namespace(
+            input=input_path,
+            output=output_path,
+            top=10,
+            reference_class="A",
+        )
+    )
+
+    grouped = pd.read_csv(output_path)
+
+    reference_rows = grouped.loc[grouped["class"] == "A"]
+
+    np.testing.assert_allclose(
+        reference_rows["contrast_contribution"].to_numpy(dtype=np.float64),
+        0.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+    np.testing.assert_allclose(
+        reference_rows["score_contrast"].to_numpy(dtype=np.float64),
+        0.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_invalid_reference_class_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """An unavailable reference class should be rejected."""
+
+    input_path = tmp_path / "component_contributions.csv"
+
+    output_path = tmp_path / "grouped_reference.csv"
+
+    _write_component_contributions(input_path)
+
+    with pytest.raises(
+        ValueError,
+        match="Reference class 'missing' is unavailable",
+    ):
+        command_grouped_contributions(
+            Namespace(
+                input=input_path,
+                output=output_path,
+                top=10,
+                reference_class="missing",
+            )
+        )

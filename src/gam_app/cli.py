@@ -1461,6 +1461,451 @@ def command_contributions(args) -> None:
     print(f"Maximum contribution-sum error: {maximum_contribution_sum_error:.17g}")
 
 
+def _add_centered_contribution_views(
+    grouped: pd.DataFrame,
+    reference_class: str | None,
+    *,
+    tolerance: float = 1e-10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Add raw-score checks, class centering, and reference contrasts."""
+
+    result = grouped.copy()
+
+    scenario_keys = [
+        "scenario_id",
+        "observation_index",
+    ]
+
+    class_keys = [
+        *scenario_keys,
+        "class",
+    ]
+
+    component_keys = [
+        *scenario_keys,
+        "component_type",
+        "component_group",
+    ]
+
+    complete_component_keys = [
+        *component_keys,
+        "class",
+    ]
+
+    #
+    # Validate class labels and group uniqueness.
+    #
+
+    result["class"] = result["class"].astype(str)
+
+    global_classes = sorted(result["class"].unique().tolist())
+
+    if len(global_classes) < 2:
+        raise ValueError("Centered contributions require at least two classes.")
+
+    duplicate_groups = result.duplicated(
+        subset=complete_component_keys,
+        keep=False,
+    )
+
+    if duplicate_groups.any():
+        duplicates = (
+            result.loc[
+                duplicate_groups,
+                complete_component_keys,
+            ]
+            .head(10)
+            .to_dict("records")
+        )
+
+        raise ValueError(
+            "Grouped contribution rows are not unique by "
+            "scenario, class, component type, and component "
+            f"group. Examples: {duplicates}."
+        )
+
+    #
+    # Each scenario must contain the same complete class set.
+    #
+
+    class_sets = result.groupby(
+        scenario_keys,
+        sort=False,
+        dropna=False,
+    )["class"].apply(lambda values: tuple(sorted(set(values))))
+
+    expected_class_tuple = tuple(global_classes)
+
+    invalid_class_sets = class_sets.loc[class_sets != expected_class_tuple]
+
+    if not invalid_class_sets.empty:
+        raise ValueError(
+            "Every scenario must contain the same complete class "
+            f"set. Expected {global_classes}."
+        )
+
+    #
+    # Every component group must be present once for every class.
+    #
+
+    component_class_counts = result.groupby(
+        component_keys,
+        sort=False,
+        dropna=False,
+    )["class"].nunique()
+
+    invalid_component_counts = component_class_counts != len(global_classes)
+
+    if invalid_component_counts.any():
+        invalid_groups = (
+            component_class_counts.loc[invalid_component_counts].head(10).to_dict()
+        )
+
+        raise ValueError(
+            "Each scenario-component group must have exactly one "
+            "contribution for every class. Invalid groups: "
+            f"{invalid_groups}."
+        )
+
+    #
+    # Construct a unique scenario-class score table.
+    #
+
+    score_consistency = result.groupby(
+        class_keys,
+        sort=False,
+        dropna=False,
+    )["class_score"].nunique(dropna=False)
+
+    if (score_consistency > 1).any():
+        raise ValueError(
+            "A scenario-class combination contains inconsistent class_score values."
+        )
+
+    scores = (
+        result.loc[
+            :,
+            [
+                *class_keys,
+                "predicted_class",
+                "class_probability",
+                "class_score",
+            ],
+        ]
+        .drop_duplicates(subset=class_keys)
+        .reset_index(drop=True)
+    )
+
+    #
+    # Verify raw contributions reconstruct raw class scores.
+    #
+
+    raw_reconstruction = (
+        result.groupby(
+            class_keys,
+            sort=False,
+            dropna=False,
+        )["contribution"]
+        .sum()
+        .rename("reconstructed_raw_score")
+        .reset_index()
+    )
+
+    score_summary = scores.merge(
+        raw_reconstruction,
+        on=class_keys,
+        validate="one_to_one",
+    )
+
+    score_summary["raw_score_error"] = np.abs(
+        score_summary["reconstructed_raw_score"] - score_summary["class_score"]
+    )
+
+    maximum_raw_error = float(score_summary["raw_score_error"].max())
+
+    if maximum_raw_error > tolerance:
+        raise ValueError(
+            "Raw grouped contributions do not reconstruct the "
+            "recorded class scores. Maximum error: "
+            f"{maximum_raw_error:.17g}."
+        )
+
+    #
+    # Class-mean-center each component group.
+    #
+
+    result["class_mean_contribution"] = result.groupby(
+        component_keys,
+        sort=False,
+        dropna=False,
+    )["contribution"].transform("mean")
+
+    result["centered_contribution"] = (
+        result["contribution"] - result["class_mean_contribution"]
+    )
+
+    result["absolute_centered_contribution"] = result["centered_contribution"].abs()
+
+    #
+    # Class-mean-center the total class score.
+    #
+
+    score_summary["class_mean_score"] = score_summary.groupby(
+        scenario_keys,
+        sort=False,
+        dropna=False,
+    )["class_score"].transform("mean")
+
+    score_summary["centered_class_score"] = (
+        score_summary["class_score"] - score_summary["class_mean_score"]
+    )
+
+    centered_reconstruction = (
+        result.groupby(
+            class_keys,
+            sort=False,
+            dropna=False,
+        )["centered_contribution"]
+        .sum()
+        .rename("reconstructed_centered_score")
+        .reset_index()
+    )
+
+    score_summary = score_summary.merge(
+        centered_reconstruction,
+        on=class_keys,
+        validate="one_to_one",
+    )
+
+    score_summary["centered_score_error"] = np.abs(
+        score_summary["reconstructed_centered_score"]
+        - score_summary["centered_class_score"]
+    )
+
+    maximum_centered_error = float(score_summary["centered_score_error"].max())
+
+    if maximum_centered_error > tolerance:
+        raise ValueError(
+            "Class-centered contributions do not reconstruct the "
+            "centered class scores. Maximum error: "
+            f"{maximum_centered_error:.17g}."
+        )
+
+    #
+    # Verify centered contributions sum to zero over classes
+    # for every scenario and component group.
+    #
+
+    centered_component_sums = (
+        result.groupby(
+            component_keys,
+            sort=False,
+            dropna=False,
+        )["centered_contribution"]
+        .sum()
+        .abs()
+    )
+
+    maximum_centered_component_sum = float(centered_component_sums.max())
+
+    if maximum_centered_component_sum > tolerance:
+        raise ValueError(
+            "Class-centered contributions do not sum to zero "
+            "across classes. Maximum absolute sum: "
+            f"{maximum_centered_component_sum:.17g}."
+        )
+
+    #
+    # Add score information for convenient CSV analysis.
+    #
+
+    result = result.merge(
+        score_summary.loc[
+            :,
+            [
+                *class_keys,
+                "class_mean_score",
+                "centered_class_score",
+                "reconstructed_raw_score",
+                "raw_score_error",
+                "reconstructed_centered_score",
+                "centered_score_error",
+            ],
+        ],
+        on=class_keys,
+        validate="many_to_one",
+    )
+
+    #
+    # Reference-class contrasts are optional.
+    #
+
+    if reference_class is None:
+        result["reference_class"] = pd.NA
+
+        result["reference_contribution"] = np.nan
+
+        result["contrast_contribution"] = np.nan
+
+        result["absolute_contrast_contribution"] = np.nan
+
+        result["reference_score"] = np.nan
+
+        result["score_contrast"] = np.nan
+
+        result["reconstructed_score_contrast"] = np.nan
+
+        result["contrast_score_error"] = np.nan
+
+        score_summary["reference_class"] = pd.NA
+
+        score_summary["reference_score"] = np.nan
+
+        score_summary["score_contrast"] = np.nan
+
+        score_summary["reconstructed_score_contrast"] = np.nan
+
+        score_summary["contrast_score_error"] = np.nan
+
+        return result, score_summary
+
+    reference_class = str(reference_class)
+
+    if reference_class not in global_classes:
+        raise ValueError(
+            f"Reference class {reference_class!r} is unavailable. "
+            f"Available classes: {global_classes}."
+        )
+
+    #
+    # Obtain the reference contribution for each component group.
+    #
+
+    reference_components = result.loc[
+        result["class"] == reference_class,
+        [
+            *component_keys,
+            "contribution",
+        ],
+    ].rename(
+        columns={
+            "contribution": "reference_contribution",
+        }
+    )
+
+    if reference_components.duplicated(subset=component_keys).any():
+        raise ValueError(
+            "Reference-class contribution rows are not unique by "
+            "scenario and component group."
+        )
+
+    result = result.merge(
+        reference_components,
+        on=component_keys,
+        how="left",
+        validate="many_to_one",
+    )
+
+    if result["reference_contribution"].isna().any():
+        raise ValueError(
+            "Reference-class contributions are missing for one or "
+            "more scenario-component groups."
+        )
+
+    result["reference_class"] = reference_class
+
+    result["contrast_contribution"] = (
+        result["contribution"] - result["reference_contribution"]
+    )
+
+    result["absolute_contrast_contribution"] = result["contrast_contribution"].abs()
+
+    #
+    # Obtain the reference score for each scenario.
+    #
+
+    reference_scores = score_summary.loc[
+        score_summary["class"] == reference_class,
+        [
+            *scenario_keys,
+            "class_score",
+        ],
+    ].rename(
+        columns={
+            "class_score": "reference_score",
+        }
+    )
+
+    if reference_scores.duplicated(subset=scenario_keys).any():
+        raise ValueError("Reference-class scores are not unique by scenario.")
+
+    score_summary = score_summary.merge(
+        reference_scores,
+        on=scenario_keys,
+        how="left",
+        validate="many_to_one",
+    )
+
+    if score_summary["reference_score"].isna().any():
+        raise ValueError(
+            "Reference-class scores are missing for one or more scenarios."
+        )
+
+    score_summary["reference_class"] = reference_class
+
+    score_summary["score_contrast"] = (
+        score_summary["class_score"] - score_summary["reference_score"]
+    )
+
+    contrast_reconstruction = (
+        result.groupby(
+            class_keys,
+            sort=False,
+            dropna=False,
+        )["contrast_contribution"]
+        .sum()
+        .rename("reconstructed_score_contrast")
+        .reset_index()
+    )
+
+    score_summary = score_summary.merge(
+        contrast_reconstruction,
+        on=class_keys,
+        validate="one_to_one",
+    )
+
+    score_summary["contrast_score_error"] = np.abs(
+        score_summary["reconstructed_score_contrast"] - score_summary["score_contrast"]
+    )
+
+    maximum_contrast_error = float(score_summary["contrast_score_error"].max())
+
+    if maximum_contrast_error > tolerance:
+        raise ValueError(
+            "Reference-class contribution contrasts do not "
+            "reconstruct class-score contrasts. Maximum error: "
+            f"{maximum_contrast_error:.17g}."
+        )
+
+    result = result.merge(
+        score_summary.loc[
+            :,
+            [
+                *class_keys,
+                "reference_score",
+                "score_contrast",
+                "reconstructed_score_contrast",
+                "contrast_score_error",
+            ],
+        ],
+        on=class_keys,
+        how="left",
+        validate="many_to_one",
+    )
+
+    return result, score_summary
+
+
 def command_grouped_contributions(args) -> None:
     """Aggregate component contributions by predictor group."""
 
@@ -1613,108 +2058,13 @@ def command_grouped_contributions(args) -> None:
 
     grouped["absolute_contribution"] = grouped["contribution"].abs()
 
-    grouped = grouped.sort_values(
-        [
-            "observation_index",
-            "class",
-            "absolute_contribution",
-            "component_type",
-            "component_group",
-        ],
-        ascending=[
-            True,
-            True,
-            False,
-            True,
-            True,
-        ],
-        kind="stable",
-    ).reset_index(drop=True)
+    reference_class = getattr(args, "reference_class", None)
 
-    original_score_sums = (
-        frame.groupby(
-            identity_columns,
-            sort=False,
-            dropna=False,
-        )["contribution"]
-        .sum()
-        .rename("component_score")
-        .reset_index()
+    grouped, centered_score_summary = _add_centered_contribution_views(
+        grouped=grouped,
+        reference_class=reference_class,
+        tolerance=1e-10,
     )
-
-    grouped_score_sums = (
-        grouped.groupby(
-            identity_columns,
-            sort=False,
-            dropna=False,
-        )["contribution"]
-        .sum()
-        .rename("grouped_score")
-        .reset_index()
-    )
-
-    expected_scores = (
-        frame.loc[
-            :,
-            [
-                *identity_columns,
-                "class_score",
-            ],
-        ]
-        .drop_duplicates(subset=identity_columns)
-        .reset_index(drop=True)
-    )
-
-    score_summary = expected_scores.merge(
-        original_score_sums,
-        on=identity_columns,
-        validate="one_to_one",
-    ).merge(
-        grouped_score_sums,
-        on=identity_columns,
-        validate="one_to_one",
-    )
-
-    score_summary["component_score_error"] = np.abs(
-        score_summary["component_score"] - score_summary["class_score"]
-    )
-
-    score_summary["grouped_score_error"] = np.abs(
-        score_summary["grouped_score"] - score_summary["class_score"]
-    )
-
-    score_summary["aggregation_error"] = np.abs(
-        score_summary["grouped_score"] - score_summary["component_score"]
-    )
-
-    maximum_component_score_error = float(score_summary["component_score_error"].max())
-
-    maximum_grouped_score_error = float(score_summary["grouped_score_error"].max())
-
-    maximum_aggregation_error = float(score_summary["aggregation_error"].max())
-
-    score_tolerance = 1e-10
-
-    if maximum_component_score_error > score_tolerance:
-        raise ValueError(
-            "The input component contributions do not reconstruct "
-            "the recorded class scores. Maximum error: "
-            f"{maximum_component_score_error:.17g}."
-        )
-
-    if maximum_grouped_score_error > score_tolerance:
-        raise ValueError(
-            "The grouped contributions do not reconstruct the "
-            "recorded class scores. Maximum error: "
-            f"{maximum_grouped_score_error:.17g}."
-        )
-
-    if maximum_aggregation_error > score_tolerance:
-        raise ValueError(
-            "Grouped contribution totals do not match the input "
-            "component-contribution totals. Maximum error: "
-            f"{maximum_aggregation_error:.17g}."
-        )
 
     output_path.parent.mkdir(
         parents=True,
@@ -1730,24 +2080,33 @@ def command_grouped_contributions(args) -> None:
 
     summary_path = output_path.with_name(f"{output_path.stem}_score_summary.csv")
 
-    score_summary.to_csv(
+    centered_score_summary.to_csv(
         summary_path,
         index=False,
         encoding="utf-8",
         float_format="%.17g",
     )
 
+    if reference_class is not None:
+        ranking_column = "absolute_contrast_contribution"
+    else:
+        ranking_column = "absolute_centered_contribution"
+
     terminal_results = (
         grouped.sort_values(
             [
                 "observation_index",
                 "class",
-                "absolute_contribution",
+                ranking_column,
+                "component_type",
+                "component_group",
             ],
             ascending=[
                 True,
                 True,
                 False,
+                True,
+                True,
             ],
             kind="stable",
         )
@@ -1769,11 +2128,25 @@ def command_grouped_contributions(args) -> None:
         "predicted_class",
         "class_probability",
         "class_score",
+        "centered_class_score",
         "component_type",
         "component_group",
         "contribution",
-        "absolute_contribution",
+        "centered_contribution",
+        "absolute_centered_contribution",
     ]
+
+    if reference_class is not None:
+        terminal_columns.extend(
+            [
+                "reference_class",
+                "reference_score",
+                "score_contrast",
+                "reference_contribution",
+                "contrast_contribution",
+                "absolute_contrast_contribution",
+            ]
+        )
 
     print()
     print("Largest grouped class-score contributions")
@@ -1799,17 +2172,35 @@ def command_grouped_contributions(args) -> None:
     print(f"Score summary: {summary_path.resolve()}")
     print(f"Component-contribution rows read: {len(frame)}")
     print(f"Grouped-contribution rows written: {len(grouped)}")
-    print(f"Scenario-class combinations: {len(score_summary)}")
+    print(f"Scenario-class combinations: {len(centered_score_summary)}")
     print(f"Component groups: {grouped['component_group'].nunique()}")
+
+    print()
+    print("Contribution interpretation")
+    print("===========================")
+    print("Raw contribution column: contribution")
+    print("Class-centered column: centered_contribution")
+
+    if reference_class is not None:
+        print("Reference-contrast column: contrast_contribution")
+        print(f"Reference class: {reference_class}")
+    else:
+        print("Reference-class contrasts: not requested")
+
     print(
-        "Maximum input score-reconstruction error: "
-        f"{maximum_component_score_error:.17g}"
+        "Maximum raw score error: "
+        f"{centered_score_summary['raw_score_error'].max():.17g}"
     )
     print(
-        "Maximum grouped score-reconstruction error: "
-        f"{maximum_grouped_score_error:.17g}"
+        "Maximum centered score error: "
+        f"{centered_score_summary['centered_score_error'].max():.17g}"
     )
-    print(f"Maximum aggregation error: {maximum_aggregation_error:.17g}")
+
+    if reference_class is not None:
+        print(
+            "Maximum contrast score error: "
+            f"{centered_score_summary['contrast_score_error'].max():.17g}"
+        )
 
 
 def command_demo(args) -> None:
@@ -2004,6 +2395,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Number of largest absolute grouped contributions to "
             "display per scenario and class. The output CSV always "
             "contains all groups."
+        ),
+    )
+
+    grouped_contributions_parser.add_argument(
+        "--reference-class",
+        type=str,
+        default=None,
+        help=(
+            "Optional reference class used to calculate contribution "
+            "and score contrasts."
         ),
     )
 
