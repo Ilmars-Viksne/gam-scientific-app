@@ -15,12 +15,12 @@ from gam_app.config import (
 from gam_app.evaluation import (
     OuterFoldResult,
     build_outer_fold_tasks,
-    create_split_manifest,
     execute_outer_fold_task,
     run_outer_folds_in_parallel,
     run_outer_folds_sequentially,
 )
 from gam_app.exceptions import ConfigurationError
+from gam_app.splitting import SplitContext, create_split_manifest
 
 
 def config(
@@ -167,11 +167,17 @@ def prepare_outer_fold_tasks(
         name="row_id",
     )
 
+    context = SplitContext(
+        X=X,
+        y=y,
+        row_ids=pd.Series(row_ids.astype(str)),
+        groups=None,
+        times=None,
+    )
+
     splits = create_split_manifest(
         cfg,
-        X,
-        y,
-        row_ids,
+        context,
     )
 
     tasks = build_outer_fold_tasks(
@@ -313,6 +319,8 @@ def test_parallel_outer_fold_results_match_sequential(
         X=X,
         y=y,
         row_ids=row_ids,
+        groups=None,
+        times=None,
         on_started=lambda task: sequential_started.append(
             (
                 task.repeat,
@@ -332,6 +340,8 @@ def test_parallel_outer_fold_results_match_sequential(
         X=X,
         y=y,
         row_ids=row_ids,
+        groups=None,
+        times=None,
         workers=2,
         on_started=lambda task: parallel_started.append(
             (

@@ -23,13 +23,13 @@ from sklearn.metrics import (
     multilabel_confusion_matrix,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 
 from .config import ExperimentConfig, ModelConfig
 from .io_utils import format_duration, utc_now, write_json_atomic
 from .logistic import extract_class_score_parameters
 from .models import build_pipeline
 from .run_store import FileRunStore
+from .splitting import create_inner_splits
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,16 +70,24 @@ def inner_search(
     X: pd.DataFrame,
     y: pd.Series,
     seed: int,
+    *,
+    groups: pd.Series | None = None,
+    times: pd.Series | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    splitter = StratifiedKFold(
-        n_splits=config.validation.inner_splits, shuffle=True, random_state=seed
+    inner_splits = create_inner_splits(
+        config=config,
+        X=X,
+        y=y,
+        groups=groups,
+        times=times,
+        seed=seed,
     )
     rows: list[dict[str, Any]] = []
     best_loss = float("inf")
     best: dict[str, Any] | None = None
     for n_knots, degree, C, scale in parameter_candidates(config, model):
         losses = []
-        for train, valid in splitter.split(X, y):
+        for train, valid in inner_splits:
             pipeline = build_pipeline(
                 config,
                 model,
@@ -126,17 +134,8 @@ def _fold_metrics(
         labels=classes,
     )
 
-    true_negatives = confusion_matrices[
-        :,
-        0,
-        0,
-    ].astype(np.float64)
-
-    false_positives = confusion_matrices[
-        :,
-        0,
-        1,
-    ].astype(np.float64)
+    true_negatives = confusion_matrices[:, 0, 0].astype(np.float64)
+    false_positives = confusion_matrices[:, 0, 1].astype(np.float64)
 
     specificity_by_class = _safe_ratio(
         true_negatives,
@@ -194,7 +193,6 @@ def _fold_metrics(
 
     for class_index, class_name in enumerate(classes):
         safe_class_name = str(class_name)
-
         metrics[f"specificity_{safe_class_name}"] = float(
             specificity_by_class[class_index]
         )
@@ -312,7 +310,6 @@ def build_outer_fold_tasks(
         ]
 
         train_indices = tuple(int(value) for value in train_values.to_numpy())
-
         test_indices = tuple(int(value) for value in test_values.to_numpy())
 
         if not train_indices:
@@ -356,10 +353,9 @@ def build_outer_fold_tasks(
         observed_indices = train_set | test_set
 
         missing_indices = sorted(expected_indices - observed_indices)
-
         unexpected_indices = sorted(observed_indices - expected_indices)
 
-        if missing_indices:
+        if config.validation.strategy != "time" and missing_indices:
             raise ValueError(
                 "The outer fold does not cover every dataset row "
                 f"for repeat={repeat}, fold={fold}. "
@@ -395,55 +391,33 @@ def build_outer_fold_tasks(
     return tasks
 
 
-def create_split_manifest(config: ExperimentConfig, X, y, row_ids) -> pd.DataFrame:
-    splitter = RepeatedStratifiedKFold(
-        n_splits=config.validation.outer_splits,
-        n_repeats=config.validation.outer_repeats,
-        random_state=config.validation.random_state,
-    )
-    rows: list[dict[str, Any]] = []
-    for iteration, (train, test) in enumerate(splitter.split(X, y), start=1):
-        repeat = (iteration - 1) // config.validation.outer_splits + 1
-        fold = (iteration - 1) % config.validation.outer_splits + 1
-        rows.extend(
-            {
-                "repeat": repeat,
-                "fold": fold,
-                "row_id": str(row_ids.iloc[i]),
-                "row_index": int(i),
-                "partition": "train",
-            }
-            for i in train
-        )
-        rows.extend(
-            {
-                "repeat": repeat,
-                "fold": fold,
-                "row_id": str(row_ids.iloc[i]),
-                "row_index": int(i),
-                "partition": "test",
-            }
-            for i in test
-        )
-    return pd.DataFrame(rows)
-
-
 def execute_outer_fold_task(
     task: OuterFoldTask,
     config: ExperimentConfig,
     X: pd.DataFrame,
     y: pd.Series,
     row_ids: pd.Series,
+    groups: pd.Series | None = None,
+    times: pd.Series | None = None,
 ) -> OuterFoldResult:
     train = np.asarray(task.train_indices, dtype=int)
     test = np.asarray(task.test_indices, dtype=int)
 
+    train_groups = (
+        groups.iloc[train].reset_index(drop=True) if groups is not None else None
+    )
+    train_times = (
+        times.iloc[train].reset_index(drop=True) if times is not None else None
+    )
+
     best, trials = inner_search(
         config,
         task.model,
-        X.iloc[train],
-        y.iloc[train],
+        X.iloc[train].reset_index(drop=True),
+        y.iloc[train].reset_index(drop=True),
         task.seed,
+        groups=train_groups,
+        times=train_times,
     )
     pipeline = build_pipeline(
         config,
@@ -520,6 +494,8 @@ def run_outer_folds_sequentially(
     X: pd.DataFrame,
     y: pd.Series,
     row_ids: pd.Series,
+    groups: pd.Series | None,
+    times: pd.Series | None,
     on_started: Callable[[OuterFoldTask], None],
     on_completed: OuterFoldCallback,
     should_stop: Callable[[], Any] = lambda: None,
@@ -528,7 +504,9 @@ def run_outer_folds_sequentially(
         if _check_stop_requested(should_stop) is not None:
             break
         on_started(task)
-        result = execute_outer_fold_task(task, config, X, y, row_ids)
+        result = execute_outer_fold_task(
+            task, config, X, y, row_ids, groups=groups, times=times
+        )
         on_completed(result)
 
 
@@ -538,6 +516,8 @@ def run_outer_folds_in_parallel(
     X: pd.DataFrame,
     y: pd.Series,
     row_ids: pd.Series,
+    groups: pd.Series | None,
+    times: pd.Series | None,
     workers: int,
     on_started: Callable[[OuterFoldTask], None],
     on_completed: OuterFoldCallback,
@@ -575,6 +555,8 @@ def run_outer_folds_in_parallel(
             X,
             y,
             row_ids,
+            groups,
+            times,
         )
 
         future_tasks[future] = task
@@ -777,6 +759,8 @@ def run_model(
     X: pd.DataFrame,
     y: pd.Series,
     row_ids: pd.Series,
+    groups: pd.Series | None,
+    times: pd.Series | None,
     splits: pd.DataFrame,
     store: FileRunStore,
     data_hash: str,
@@ -893,6 +877,8 @@ def run_model(
             X,
             y,
             row_ids,
+            groups,
+            times,
             on_started,
             on_completed,
             should_stop,
@@ -904,6 +890,8 @@ def run_model(
             X,
             y,
             row_ids,
+            groups,
+            times,
             config.execution.workers,
             on_started,
             on_completed,
@@ -932,6 +920,9 @@ def fit_final_model(
     X: pd.DataFrame,
     y: pd.Series,
     store: FileRunStore,
+    *,
+    groups: pd.Series | None = None,
+    times: pd.Series | None = None,
 ) -> None:
     """Tune and fit the final model using the complete dataset."""
 
@@ -961,6 +952,8 @@ def fit_final_model(
         X=X,
         y=y,
         seed=config.validation.random_state,
+        groups=groups,
+        times=times,
     )
 
     pipeline = build_pipeline(
