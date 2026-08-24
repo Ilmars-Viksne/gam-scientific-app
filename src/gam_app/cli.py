@@ -13,6 +13,11 @@ import pandas as pd
 
 from .config import load_config
 from .data import infer_role, load_table, profile_data, save_profile
+from .diagnostics import (
+    StandaloneDiagnosticSettings,
+    calculate_standalone_diagnostics,
+    write_standalone_diagnostics,
+)
 from .inspection import inspect_model, verify_link
 from .io_utils import read_json, write_yaml_atomic
 from .logistic import extract_class_score_parameters
@@ -52,8 +57,33 @@ def _preset(name: str) -> dict:
 
 
 def command_profile(args) -> None:
-    profile = profile_data(args.data, args.target)
-    save_profile(profile, args.output)
+    data_path = Path(args.data)
+    output_directory = Path(args.output)
+
+    profile = profile_data(data_path, args.target)
+    save_profile(profile, output_directory)
+
+    frame = load_table(data_path)
+
+    settings = StandaloneDiagnosticSettings(
+        correlation_review_threshold=float(args.review_correlation),
+        correlation_warning_threshold=float(args.warn_correlation),
+        minimum_complete_pairs=3,
+        near_duplicate_decimals=int(args.near_duplicate_decimals),
+    )
+
+    diagnostics = calculate_standalone_diagnostics(
+        frame=frame,
+        target=args.target,
+        settings=settings,
+    )
+
+    write_standalone_diagnostics(
+        diagnostics=diagnostics,
+        output_directory=output_directory,
+        settings=settings,
+    )
+
     print(json.dumps(profile, indent=2))
 
 
