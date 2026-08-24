@@ -96,6 +96,7 @@ def command_configure(args) -> None:
         spec: dict[str, Any] = {
             "role": role,
             "missing": "error",
+            "derived": "none",
         }
 
         if role == "categorical":
@@ -126,7 +127,7 @@ def command_configure(args) -> None:
     preset_values: dict[str, Any] = _preset(preset)
 
     payload: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "experiment": {
             "name": args.name or args.data.stem,
             "primary_metric": "log_loss",
@@ -135,6 +136,8 @@ def command_configure(args) -> None:
             "path": str(args.data.resolve()),
             "target": args.target,
             "row_id": args.row_id,
+            "group": args.group,
+            "time": args.time,
         },
         "features": features,
         "models": [
@@ -147,11 +150,35 @@ def command_configure(args) -> None:
                 "interactions": "all_eligible",
             },
         ],
+        "profiling": {
+            "correlation": {
+                "enabled": True,
+                "pearson": True,
+                "spearman": True,
+                "review_threshold": 0.75,
+                "warning_threshold": 0.90,
+                "minimum_complete_pairs": 3,
+            },
+            "duplicate_groups": {
+                "enabled": True,
+                "rounding_decimals": 8,
+                "near_duplicate_threshold": 0.98,
+                "include_target_in_signature": False,
+            },
+        },
         "validation": {
+            "strategy": args.validation_strategy,
             "outer_splits": preset_values["outer_splits"],
-            "outer_repeats": preset_values["outer_repeats"],
+            "outer_repeats": (
+                1
+                if args.validation_strategy == "time"
+                else preset_values["outer_repeats"]
+            ),
             "inner_splits": preset_values["inner_splits"],
             "random_state": 42,
+            "gap": args.gap,
+            "test_size": None,
+            "duplicate_group_policy": "report",
         },
         "search": {
             "n_knots": preset_values["n_knots"],
@@ -899,7 +926,7 @@ def command_transform(args) -> None:
 
 
 def command_contributions(args) -> None:
-    """Export transformed-component contributions to class scores."""
+    """Export transformed-component contributions to every class score."""
 
     model_path = Path(args.model)
     input_path = Path(args.input)
@@ -2235,6 +2262,9 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--data", type=Path, required=True)
     profile.add_argument("--target", required=True)
     profile.add_argument("--output", type=Path, required=True)
+    profile.add_argument("--review-correlation", type=float, default=0.75)
+    profile.add_argument("--warn-correlation", type=float, default=0.90)
+    profile.add_argument("--near-duplicate-decimals", type=int, default=8)
     profile.set_defaults(func=command_profile)
     configure = sub.add_parser("configure")
     configure.add_argument("--data", type=Path, required=True)
@@ -2242,6 +2272,14 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--output", type=Path, required=True)
     configure.add_argument("--name")
     configure.add_argument("--row-id")
+    configure.add_argument("--group")
+    configure.add_argument("--time")
+    configure.add_argument(
+        "--validation-strategy",
+        choices=["stratified", "stratified_group", "time"],
+        default="stratified",
+    )
+    configure.add_argument("--gap", type=int, default=0)
     configure.add_argument(
         "--preset", choices=["quick", "standard", "thorough"], default="standard"
     )
