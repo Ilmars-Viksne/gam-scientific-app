@@ -258,6 +258,55 @@ def test_create_reports_generates_expected_outputs(
         encoding="utf-8",
     )
 
+    # Add diagnostics directory & manifest
+    diag_dir = store.root / "diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    diag_manifest = {
+        "schema_name": "gam_diagnostics_manifest",
+        "schema_version": "1.0",
+        "status": "completed",
+        "validation": {
+            "strategy": "stratified",
+            "duplicate_group_policy": "report",
+            "duplicate_grouping_applied": False,
+            "outer_splits": 2,
+            "outer_repeats": 1,
+            "inner_splits": 2,
+            "random_state": 42,
+            "gap": 0,
+            "test_size": None,
+        },
+        "split_integrity": {
+            "passed": True,
+            "result_count": 10,
+            "failed_result_count": 0,
+            "artifact": "split_integrity.csv",
+        },
+        "analyses": {
+            "duplicate_groups": {
+                "status": "completed",
+                "results": {
+                    "exact_group_count": 1,
+                    "proper_near_group_count": 0,
+                    "conflicting_target_group_count": 1,
+                },
+            },
+        },
+        "artifacts": [
+            {
+                "id": "conflicting_duplicate_targets",
+                "path": "conflicting_duplicate_targets.csv",
+                "status": "written",
+            },
+        ],
+    }
+    (diag_dir / "diagnostics_manifest.json").write_text(
+        json.dumps(diag_manifest), encoding="utf-8"
+    )
+    (diag_dir / "conflicting_duplicate_targets.csv").write_text(
+        "signature,target\nsig1,A\nsig1,B"
+    )
+
     create_reports(test_experiment_config, store)
 
     report_path = store.reports / "report.html"
@@ -266,6 +315,9 @@ def test_create_reports_generates_expected_outputs(
 
     # Check key sections
     assert "Dataset overview" in html_content
+    assert "Validation design" in html_content
+    assert "Predictor diagnostics" in html_content
+    assert "Conflicting duplicate targets detected." in html_content
     assert "Class distribution" in html_content
     assert "Final-model metadata" in html_content
     assert "Final full-data inner-CV hyperparameter selection" in html_content

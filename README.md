@@ -807,6 +807,11 @@ reports/report.html
 It includes:
 
 - experiment identity;
+- validation design and split-integrity status summary;
+- predictor-diagnostics count summary (review/warning correlations, declared derived features, suspected relations, exact/near duplicate groups, conflicting duplicate target groups);
+- prominent warning if duplicate-target conflicts exist;
+- compact preview of high predictor correlations (limited to top 10 pairs, linking full CSV report);
+- links to complete diagnostic artifacts (`Predictor dictionary`, correlation matrices, duplicate reports, etc.);
 - model summaries;
 - nested-CV metrics;
 - confusion matrices;
@@ -1062,6 +1067,27 @@ The app produces standardized, machine-verifiable diagnostics artifacts and a sc
 - **Dominant method & tie rules**: Each pair identifies `dominant_method` (`pearson`, `spearman`, `tie`, `none`). When Pearson and Spearman magnitudes match within $10^{-12}$, `dominant_method` is `"tie"` and `dominant_correlation` is `null` (empty in CSV).
 - **Trigger methods**: Format uses fixed method order (`pearson|spearman`).
 - **Coverage**: Includes `complete_pair_count`, `row_count`, and `complete_pair_fraction`.
+
+### Validation Design & Predictor Diagnostics Reporting (GAM-109 – GAM-112)
+- **Validation Design Summary**:
+  - Displays strategy (`stratified`, `stratified_group`, `time`), configured group column, time column, duplicate policy, fold settings, random state, temporal gap, temporal test size, and split-integrity status.
+  - Unconfigured group or time columns display as `Not configured`.
+  - Non-time strategy temporal settings display as `Not applicable`.
+  - Missing metadata displays as `Not available`.
+- **Predictor Diagnostics Count Summary**:
+  - Summarizes review-level correlation pairs (`severity == "review"`), warning-level correlation pairs (`severity == "warning"`), declared derived predictors, suspected derived relations, exact duplicate groups, proper near-duplicate groups, and conflicting duplicate target groups.
+  - Review and warning correlation counts are mutually exclusive (their sum equals total high-correlation pairs).
+  - Analysis status is distinguished: `completed` displays numerical counts, `disabled` displays `Not evaluated`, `failed` displays `Unavailable`, and `not_applicable` displays `Not applicable`.
+- **Compact Correlation Preview**:
+  - Inline preview table displays at most the top 10 high-correlation pairs using canonical ordering.
+  - Formats coverage as percentage (`.1%`) and correlation values to four decimal places (`.4f`).
+  - Displays truncation status (e.g. `Showing 10 of 25 high-correlation pairs.`) and links to `high_correlation_pairs.csv`.
+- **Prominent Duplicate-Target Conflict Warning**:
+  - Prominently displays an alert banner when `conflicting_duplicate_target_group_count > 0`.
+  - Wording explains that predictor-identical records have different target labels and cannot be distinguished deterministically from available predictors alone.
+  - Does not call dataset invalid, or recommend record deletion or relabeling.
+- **Diagnostic Artifact Links**:
+  - Links to diagnostic artifacts (labeled `Predictor dictionary` for the predictor dictionary artifact) only when the artifact entry status is `written` and the file exists.
 
 ### Data Dictionary & Derivation Status Vocabularies
 - **`metadata_status`**: `provided` vs `not_provided`.
