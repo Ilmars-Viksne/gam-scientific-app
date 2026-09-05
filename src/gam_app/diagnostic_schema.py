@@ -97,12 +97,14 @@ SUSPECTED_DERIVED_RELATION_COLUMNS: Final[tuple[str, ...]] = (
 )
 
 SPLIT_INTEGRITY_COLUMNS: Final[tuple[str, ...]] = (
+    "strategy",
+    "scope",
+    "repeat",
+    "fold",
     "check",
     "passed",
-    "split_count",
-    "distinct_split_types",
-    "total_evaluation_rows",
-    "failed_split_count",
+    "observed",
+    "expected",
     "details",
 )
 

@@ -309,10 +309,7 @@ def run_matches_filter(run: RunSummary, filters: RunFilter) -> bool:
     if filters.states and run.state not in filters.states:
         return False
 
-    if (
-        filters.experiment_names
-        and run.experiment_name not in filters.experiment_names
-    ):
+    if filters.experiment_names and run.experiment_name not in filters.experiment_names:
         return False
 
     if (

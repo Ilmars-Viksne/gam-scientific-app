@@ -590,9 +590,13 @@ def command_list_runs(args) -> None:
         if filters.experiment_names:
             active_filters["experiment_names"] = list(filters.experiment_names)
         if filters.validation_strategies:
-            active_filters["validation_strategies"] = list(filters.validation_strategies)
+            active_filters["validation_strategies"] = list(
+                filters.validation_strategies
+            )
         if filters.duplicate_group_policies:
-            active_filters["duplicate_group_policies"] = list(filters.duplicate_group_policies)
+            active_filters["duplicate_group_policies"] = list(
+                filters.duplicate_group_policies
+            )
         if filters.model_ids:
             active_filters["model_ids"] = list(filters.model_ids)
         if filters.tags:
@@ -2834,20 +2838,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--tag",
         action="append",
         default=[],
-        help=(
-            "Add a searchable experiment tag. "
-            "May be supplied more than once."
-        ),
+        help=("Add a searchable experiment tag. May be supplied more than once."),
     )
     configure.add_argument(
         "--metadata",
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help=(
-            "Add searchable run metadata. "
-            "May be supplied more than once."
-        ),
+        help=("Add searchable run metadata. May be supplied more than once."),
     )
 
     duplicate_group_toggle = configure.add_mutually_exclusive_group()

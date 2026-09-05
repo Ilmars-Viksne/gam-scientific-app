@@ -73,7 +73,9 @@ def test_create_run_result_returns_rich_dataclass(tmp_path: Path) -> None:
     assert metadata["metadata"] == {"meta1": "val1"}
 
 
-def test_command_run_prints_path_before_execute_run(capsys: pytest.CaptureFixture, tmp_path: Path) -> None:
+def test_command_run_prints_path_before_execute_run(
+    capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
     config_file = tmp_path / "config.yaml"
     data_file = tmp_path / "data.csv"
     data_file.write_text("x1,target\n1,A\n2,B\n", encoding="utf-8")
@@ -96,13 +98,18 @@ def test_command_run_prints_path_before_execute_run(capsys: pytest.CaptureFixtur
     run_path_file = tmp_path / "latest_run.txt"
 
     parser = build_parser()
-    args = parser.parse_args([
-        "run",
-        "--config", str(config_file),
-        "--workspace", str(workspace),
-        "--run-path-file", str(run_path_file),
-        "--json",
-    ])
+    args = parser.parse_args(
+        [
+            "run",
+            "--config",
+            str(config_file),
+            "--workspace",
+            str(workspace),
+            "--run-path-file",
+            str(run_path_file),
+            "--json",
+        ]
+    )
 
     with patch("gam_app.cli.execute_run") as mock_execute:
         mock_execute.side_effect = RuntimeError("Simulated execution failure")
@@ -117,7 +124,9 @@ def test_command_run_prints_path_before_execute_run(capsys: pytest.CaptureFixtur
     assert "workspace/runs/run-" in file_content
 
 
-def test_create_only_does_not_call_execute_run(capsys: pytest.CaptureFixture, tmp_path: Path) -> None:
+def test_create_only_does_not_call_execute_run(
+    capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
     config_file = tmp_path / "config.yaml"
     data_file = tmp_path / "data.csv"
     data_file.write_text("x1,target\n1,A\n2,B\n", encoding="utf-8")
@@ -139,13 +148,17 @@ def test_create_only_does_not_call_execute_run(capsys: pytest.CaptureFixture, tm
     workspace = tmp_path / "workspace"
 
     parser = build_parser()
-    args = parser.parse_args([
-        "run",
-        "--config", str(config_file),
-        "--workspace", str(workspace),
-        "--create-only",
-        "--json",
-    ])
+    args = parser.parse_args(
+        [
+            "run",
+            "--config",
+            str(config_file),
+            "--workspace",
+            str(workspace),
+            "--create-only",
+            "--json",
+        ]
+    )
 
     with patch("gam_app.cli.execute_run") as mock_execute:
         args.func(args)
@@ -177,7 +190,9 @@ def test_failed_initialization_cleans_up_directory(tmp_path: Path) -> None:
 
     workspace = tmp_path / "workspace"
 
-    with patch("gam_app.workflow.write_json_atomic", side_effect=RuntimeError("IO Error")):
+    with patch(
+        "gam_app.workflow.write_json_atomic", side_effect=RuntimeError("IO Error")
+    ):
         with pytest.raises(RuntimeError, match="IO Error"):
             create_run(config_file, workspace)
 

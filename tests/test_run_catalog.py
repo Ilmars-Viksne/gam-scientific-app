@@ -70,7 +70,9 @@ def test_run_matches_filter_logic() -> None:
     # Creation range filter
     after = parse_datetime_argument("2026-09-01", is_end_of_day=False)
     before = parse_datetime_argument("2026-09-10", is_end_of_day=True)
-    assert run_matches_filter(summary, RunFilter(created_after=after, created_before=before))
+    assert run_matches_filter(
+        summary, RunFilter(created_after=after, created_before=before)
+    )
 
     after_too_late = parse_datetime_argument("2026-09-06", is_end_of_day=False)
     assert not run_matches_filter(summary, RunFilter(created_after=after_too_late))

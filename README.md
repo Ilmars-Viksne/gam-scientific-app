@@ -1230,30 +1230,35 @@ gam-app run `
 
 # 22. Automated tests
 
-Run:
+Run the complete test suite:
 
 ```powershell
-pytest
+poetry run pytest
 ```
 
-Included tests cover:
+You can also run targeted subsets using registered Pytest markers:
 
-- transformation dimensions;
-- stable feature names;
-- finite transformed values;
-- pairwise tensor-product features;
-- invalid interaction rejection;
-- serialization round trip;
-- probabilities summing to one;
-- softmax reconstruction;
-- reproducible outer split behaviour;
-- every observation appearing once per repeat as test data.
-
-The included test suite completed successfully:
-
-```text
-4 passed
+```powershell
+poetry run pytest -m e2e
+poetry run pytest -m property
+poetry run pytest -m "not e2e"
 ```
+
+### Comprehensive Test Coverage
+
+- **End-to-End Scientific Workflows (`tests/test_e2e_*.py`)**:
+  Coordinated end-to-end verification that complete runs produce scientifically valid splits and mutually consistent persisted artifacts across all three validation strategies:
+  - `stratified`: Ordinary stratified cross-validation with diagnostic duplicate reporting (`tests/test_e2e_stratified_diagnostics.py`).
+  - `stratified_group`: Transitive effective group creation and inner/outer fold group leakage protection (`tests/test_e2e_group_aware.py`).
+  - `time`: Chronological time-series splitting with gap and test-size enforcement (`tests/test_e2e_time_aware.py`).
+- **Property-Based Near-Duplicate Invariants (`tests/test_near_duplicate_properties.py`)**:
+  Hypothesis property tests covering symmetry, reflexivity, boundedness, threshold monotonicity, target invariance, row permutation invariance, connected component transitivity, and string/signed-zero canonicalization.
+- **Diagnostic Artifact Schema Contracts (`tests/test_diagnostic_artifact_schemas.py`)**:
+  Centralized contract tests checking exact column ordering, empty/populated state compatibility, controlled vocabularies, identifier uniqueness, semantic column relationships, strict JSON parsing, and disk manifest byte/hash/row inventory verification.
+- **Invalid Configuration Matrix (`tests/test_invalid_configuration_matrix.py`)**:
+  Comprehensive parameterized matrix validating configuration rules, reserved role conflicts, predictor overlap, strategy constraints, duplicate policies, tags/metadata rules, and actionable error messages.
+- **Focused Unit Coverage**:
+  Transformation dimensions, stable feature names, tensor-product features, serialization round trips, link function probabilities, CLI subcommands, split integrity checks, run catalog filtering, and model checkpointing.
 
 ---
 
