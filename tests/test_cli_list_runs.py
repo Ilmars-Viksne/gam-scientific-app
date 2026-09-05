@@ -7,7 +7,9 @@ from gam_app.cli import build_parser
 from gam_app.workflow import create_run_result
 
 
-def test_cli_list_runs_text_and_json_output(capsys: pytest.CaptureFixture, tmp_path: Path) -> None:
+def test_cli_list_runs_text_and_json_output(
+    capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
     data_file = tmp_path / "data.csv"
     data_file.write_text("x1,target\n1,A\n2,B\n", encoding="utf-8")
 
@@ -36,11 +38,15 @@ def test_cli_list_runs_text_and_json_output(capsys: pytest.CaptureFixture, tmp_p
     parser = build_parser()
 
     # Test text output mode
-    args_text = parser.parse_args([
-        "list-runs",
-        "--workspace", str(workspace),
-        "--tag", "candidate",
-    ])
+    args_text = parser.parse_args(
+        [
+            "list-runs",
+            "--workspace",
+            str(workspace),
+            "--tag",
+            "candidate",
+        ]
+    )
     args_text.func(args_text)
 
     captured = capsys.readouterr()
@@ -49,12 +55,16 @@ def test_cli_list_runs_text_and_json_output(capsys: pytest.CaptureFixture, tmp_p
     assert "candidate" in captured.out
 
     # Test JSON output mode
-    args_json = parser.parse_args([
-        "list-runs",
-        "--workspace", str(workspace),
-        "--metadata", "project=study-a",
-        "--json",
-    ])
+    args_json = parser.parse_args(
+        [
+            "list-runs",
+            "--workspace",
+            str(workspace),
+            "--metadata",
+            "project=study-a",
+            "--json",
+        ]
+    )
     args_json.func(args_json)
 
     captured_json = capsys.readouterr()
@@ -66,7 +76,9 @@ def test_cli_list_runs_text_and_json_output(capsys: pytest.CaptureFixture, tmp_p
     assert catalog_data["runs"][0]["metadata"] == {"project": "study-a"}
 
 
-def test_cli_list_runs_empty_result(capsys: pytest.CaptureFixture, tmp_path: Path) -> None:
+def test_cli_list_runs_empty_result(
+    capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
     workspace = tmp_path / "workspace"
 
     parser = build_parser()
@@ -78,7 +90,9 @@ def test_cli_list_runs_empty_result(capsys: pytest.CaptureFixture, tmp_path: Pat
     assert "No runs matched the supplied filters." in captured.out
 
     # Empty JSON
-    args_json = parser.parse_args(["list-runs", "--workspace", str(workspace), "--json"])
+    args_json = parser.parse_args(
+        ["list-runs", "--workspace", str(workspace), "--json"]
+    )
     args_json.func(args_json)
     captured_json = capsys.readouterr()
     payload = json.loads(captured_json.out)
