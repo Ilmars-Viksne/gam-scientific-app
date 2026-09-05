@@ -16,6 +16,25 @@ SUPPORTED_CONFIG_SCHEMA_VERSIONS = ("1.0", "1.1")
 LEGACY_CONFIG_SCHEMA_VERSIONS = ("1.0",)
 
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+RUN_METADATA_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+RESERVED_METADATA_KEYS = {
+    "run_id",
+    "state",
+    "created_at_utc",
+    "updated_at_utc",
+    "config_hash",
+    "data_hash",
+    "experiment",
+    "validation",
+    "models",
+    "schema_name",
+    "schema_version",
+    "created_run_path",
+    "created_workspace_path",
+    "tags",
+    "metadata",
+    "labels",
+}
 
 Role = Literal["smooth", "linear", "categorical", "exclude"]
 ValidationStrategy = Literal["stratified", "stratified_group", "time"]
@@ -111,9 +130,47 @@ class ExperimentConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     primary_metric: Literal["log_loss"] = "log_loss"
+    tags: tuple[str, ...] = ()
+    metadata: dict[str, str] = field(default_factory=dict)
     schema_version: str = CURRENT_CONFIG_SCHEMA_VERSION
 
     def validate(self) -> None:
+        # Validate tags
+        if len(self.tags) > 32:
+            raise ConfigurationError("At most 32 tags can be configured.")
+        seen_tags_lower: set[str] = set()
+        for tag in self.tags:
+            trimmed = tag.strip()
+            if not trimmed:
+                raise ConfigurationError("Tags cannot be empty or whitespace-only.")
+            if len(trimmed) > 64:
+                raise ConfigurationError(
+                    f"Tag {tag!r} exceeds maximum length of 64 characters."
+                )
+            if trimmed.casefold() in seen_tags_lower:
+                raise ConfigurationError(f"Duplicate tag {tag!r} specified.")
+            seen_tags_lower.add(trimmed.casefold())
+
+        # Validate metadata
+        for key, value in self.metadata.items():
+            if not RUN_METADATA_KEY_PATTERN.fullmatch(key):
+                raise ConfigurationError(
+                    f"Metadata key {key!r} is invalid. Keys must start with a letter and "
+                    "contain only letters, digits, underscores, dots, or hyphens (max 64 chars)."
+                )
+            if key in RESERVED_METADATA_KEYS:
+                raise ConfigurationError(
+                    f"Metadata key {key!r} is reserved and cannot be overwritten."
+                )
+            if not isinstance(value, str):
+                raise ConfigurationError(
+                    f"Metadata value for key {key!r} must be a string."
+                )
+            if len(value) > 256:
+                raise ConfigurationError(
+                    f"Metadata value for key {key!r} exceeds maximum length of 256 characters."
+                )
+
         if self.schema_version not in SUPPORTED_CONFIG_SCHEMA_VERSIONS:
             raise ConfigurationError(
                 f"Unsupported configuration schema_version {self.schema_version!r}. "
@@ -420,6 +477,12 @@ def parse_config_payload(
     execution = ExecutionConfig(**payload.get("execution", {}))
 
     exp_raw = payload.get("experiment", {})
+    raw_tags = exp_raw.get("tags") or ()
+    parsed_tags = tuple(str(t).strip() for t in raw_tags)
+
+    raw_meta = exp_raw.get("metadata") or {}
+    parsed_meta = {str(k).strip(): str(v).strip() for k, v in raw_meta.items()}
+
     config = ExperimentConfig(
         schema_version=str(payload.get("schema_version", "1.0")),
         name=exp_raw.get("name", ""),
@@ -435,6 +498,8 @@ def parse_config_payload(
         validation=validation,
         search=search,
         execution=execution,
+        tags=parsed_tags,
+        metadata=parsed_meta,
     )
     return config
 
@@ -453,6 +518,8 @@ def dump_config_dict(config: ExperimentConfig) -> dict[str, Any]:
         "experiment": {
             "name": config.name,
             "primary_metric": config.primary_metric,
+            "tags": list(config.tags),
+            "metadata": {k: config.metadata[k] for k in sorted(config.metadata)},
         },
         "data": {
             "path": str(config.data_path),

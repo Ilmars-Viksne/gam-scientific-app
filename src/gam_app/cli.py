@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -29,11 +30,18 @@ from .diagnostics import (
     write_standalone_diagnostics,
 )
 from .inspection import inspect_model, verify_link
-from .io_utils import read_json, sha256_file, write_yaml_atomic
+from .io_utils import read_json, sha256_file, write_text_atomic, write_yaml_atomic
 from .logistic import extract_class_score_parameters
 from .reporting import create_reports
+from .run_catalog import (
+    CATALOG_SCHEMA_NAME,
+    CATALOG_SCHEMA_VERSION,
+    RunFilter,
+    discover_runs,
+    parse_datetime_argument,
+)
 from .run_store import FileRunStore
-from .workflow import create_run, execute_run
+from .workflow import create_run_result, execute_run
 
 
 def _value_or_default(value: int | None, default: int) -> int:
@@ -202,11 +210,22 @@ def command_configure(args) -> None:
         default_outer_repeats,
     )
 
+    parsed_metadata: dict[str, str] = {}
+    for raw_item in args.metadata:
+        key, sep, val = raw_item.partition("=")
+        if not sep:
+            raise ValueError(
+                f"Invalid metadata argument {raw_item!r}. Expected KEY=VALUE."
+            )
+        parsed_metadata[key.strip()] = val.strip()
+
     payload: dict[str, Any] = {
         "schema_version": CURRENT_CONFIG_SCHEMA_VERSION,
         "experiment": {
             "name": args.name or args.data.stem,
             "primary_metric": "log_loss",
+            "tags": args.tag,
+            "metadata": parsed_metadata,
         },
         "data": {
             "path": str(args.data.resolve()),
@@ -523,10 +542,162 @@ def command_plan(args) -> None:
     print(pd.DataFrame(models_estimates).to_string(index=False))
 
 
+def _parse_created_after_arg(value: str) -> Any:
+    return parse_datetime_argument(value, is_end_of_day=False)
+
+
+def _parse_created_before_arg(value: str) -> Any:
+    return parse_datetime_argument(value, is_end_of_day=True)
+
+
+def command_list_runs(args) -> None:
+    parsed_metadata_equals: list[tuple[str, str]] = []
+    for raw_item in args.metadata:
+        key, sep, val = raw_item.partition("=")
+        if not sep:
+            raise ValueError(
+                f"Invalid metadata argument {raw_item!r}. Expected KEY=VALUE."
+            )
+        parsed_metadata_equals.append((key.strip(), val.strip()))
+
+    filters = RunFilter(
+        states=tuple(args.state),
+        experiment_names=tuple(args.experiment),
+        validation_strategies=tuple(args.strategy),
+        duplicate_group_policies=tuple(args.duplicate_policy),
+        model_ids=tuple(args.model),
+        tags=tuple(args.tag),
+        metadata_equals=tuple(parsed_metadata_equals),
+        created_after=args.created_after,
+        created_before=args.created_before,
+        data_hash=args.data_hash,
+        config_hash=args.config_hash,
+    )
+
+    catalog = discover_runs(
+        workspace=args.workspace,
+        filters=filters,
+        limit=args.limit,
+        include_invalid=args.include_invalid,
+    )
+
+    json_mode = getattr(args, "json", False)
+
+    if json_mode:
+        active_filters: dict[str, Any] = {}
+        if filters.states:
+            active_filters["states"] = list(filters.states)
+        if filters.experiment_names:
+            active_filters["experiment_names"] = list(filters.experiment_names)
+        if filters.validation_strategies:
+            active_filters["validation_strategies"] = list(filters.validation_strategies)
+        if filters.duplicate_group_policies:
+            active_filters["duplicate_group_policies"] = list(filters.duplicate_group_policies)
+        if filters.model_ids:
+            active_filters["model_ids"] = list(filters.model_ids)
+        if filters.tags:
+            active_filters["tags"] = list(filters.tags)
+        if filters.metadata_equals:
+            active_filters["metadata"] = dict(filters.metadata_equals)
+        if filters.created_after:
+            active_filters["created_after"] = filters.created_after.isoformat()
+        if filters.created_before:
+            active_filters["created_before"] = filters.created_before.isoformat()
+        if filters.data_hash:
+            active_filters["data_hash"] = filters.data_hash
+        if filters.config_hash:
+            active_filters["config_hash"] = filters.config_hash
+
+        out_json: dict[str, Any] = {
+            "schema_name": CATALOG_SCHEMA_NAME,
+            "schema_version": CATALOG_SCHEMA_VERSION,
+            "workspace": args.workspace.resolve().as_posix(),
+            "filters": active_filters,
+            "matched_count": catalog.matched_count,
+            "invalid_run_count": catalog.invalid_run_count,
+            "runs": [r.to_dict() for r in catalog.runs],
+        }
+        if catalog.warnings:
+            out_json["warnings"] = list(catalog.warnings)
+
+        print(
+            json.dumps(out_json, indent=2, ensure_ascii=False, allow_nan=False),
+            flush=True,
+        )
+        return
+
+    # Text output mode
+    if not catalog.runs:
+        print("No runs matched the supplied filters.")
+        if catalog.invalid_run_count > 0:
+            print(f"({catalog.invalid_run_count} invalid run directory(s) skipped)")
+        return
+
+    rows: list[dict[str, Any]] = []
+    for run in catalog.runs:
+        created_str = run.created_at_utc or "unknown"
+        if created_str.endswith("+00:00"):
+            created_str = created_str.replace("+00:00", "Z")
+
+        rows.append(
+            {
+                "run_id": run.run_id,
+                "created_at_utc": created_str,
+                "state": run.state,
+                "experiment": run.experiment_name or "unknown",
+                "strategy": run.validation_strategy or "unknown",
+                "models": ",".join(run.model_ids) if run.model_ids else "none",
+                "tags": ",".join(run.tags) if run.tags else "",
+                "path": run.run_directory.resolve().as_posix(),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    print(df.to_string(index=False))
+
+    if catalog.invalid_run_count > 0:
+        print(f"\n({catalog.invalid_run_count} invalid run directory(s) skipped)")
+
+
 def command_run(args) -> None:
-    run = create_run(args.config, args.workspace)
-    print(f"Run directory: {run.resolve()}")
-    execute_run(run)
+    created = create_run_result(args.config, args.workspace)
+    resolved_run_directory = created.run_directory.resolve()
+
+    if args.run_path_file is not None:
+        write_text_atomic(
+            args.run_path_file,
+            f"{resolved_run_directory.as_posix()}\n",
+        )
+
+    json_mode = getattr(args, "json", False)
+    if json_mode:
+        creation_payload = {
+            "schema_name": "gam_run_creation",
+            "schema_version": "1.0",
+            "run_id": created.run_id,
+            "run_path": resolved_run_directory.as_posix(),
+            "state": "created",
+            "execution_started": not args.create_only,
+        }
+        print(
+            json.dumps(
+                creation_payload,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            flush=True,
+        )
+    else:
+        print(f"Run directory: {resolved_run_directory}", flush=True)
+
+    if args.create_only:
+        return
+
+    if json_mode:
+        with contextlib.redirect_stdout(sys.stderr):
+            execute_run(created.run_directory)
+    else:
+        execute_run(created.run_directory)
 
 
 def command_resume(args) -> None:
@@ -2659,6 +2830,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=10_000,
         help="Maximum dataset size allowed for exact pairwise near-duplicate analysis.",
     )
+    configure.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help=(
+            "Add a searchable experiment tag. "
+            "May be supplied more than once."
+        ),
+    )
+    configure.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Add searchable run metadata. "
+            "May be supplied more than once."
+        ),
+    )
 
     duplicate_group_toggle = configure.add_mutually_exclusive_group()
     duplicate_group_toggle.add_argument(
@@ -2727,6 +2917,22 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--workspace", type=Path, default=Path("workspace"))
+    run.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable run creation information as JSON.",
+    )
+    run.add_argument(
+        "--create-only",
+        action="store_true",
+        help="Create and initialize the run directory without starting execution.",
+    )
+    run.add_argument(
+        "--run-path-file",
+        type=Path,
+        default=None,
+        help="Atomically write the absolute created run directory path to this file.",
+    )
     run.set_defaults(func=command_run)
     status = sub.add_parser("status")
     status.add_argument("--run", type=Path, required=True)
@@ -2891,6 +3097,100 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--rows", type=int, default=300)
     demo.add_argument("--seed", type=int, default=42)
     demo.set_defaults(func=command_demo)
+
+    list_runs = sub.add_parser(
+        "list-runs",
+        help="List and filter runs in a workspace.",
+    )
+    list_runs.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path("workspace"),
+    )
+    list_runs.add_argument(
+        "--state",
+        action="append",
+        default=[],
+        choices=[
+            "created",
+            "running",
+            "paused",
+            "completed",
+            "failed",
+            "cancelled",
+            "unknown",
+        ],
+    )
+    list_runs.add_argument(
+        "--experiment",
+        action="append",
+        default=[],
+    )
+    list_runs.add_argument(
+        "--strategy",
+        choices=[
+            "stratified",
+            "stratified_group",
+            "time",
+        ],
+        action="append",
+        default=[],
+    )
+    list_runs.add_argument(
+        "--duplicate-policy",
+        choices=[
+            "report",
+            "error",
+            "group",
+        ],
+        action="append",
+        default=[],
+    )
+    list_runs.add_argument(
+        "--model",
+        action="append",
+        default=[],
+    )
+    list_runs.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+    )
+    list_runs.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+    )
+    list_runs.add_argument(
+        "--created-after",
+        type=_parse_created_after_arg,
+    )
+    list_runs.add_argument(
+        "--created-before",
+        type=_parse_created_before_arg,
+    )
+    list_runs.add_argument(
+        "--data-hash",
+    )
+    list_runs.add_argument(
+        "--config-hash",
+    )
+    list_runs.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+    )
+    list_runs.add_argument(
+        "--json",
+        action="store_true",
+    )
+    list_runs.add_argument(
+        "--include-invalid",
+        action="store_true",
+    )
+    list_runs.set_defaults(func=command_list_runs)
+
     return parser
 
 

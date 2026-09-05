@@ -78,6 +78,22 @@ Run:
 gam-app run --config configs/demo.yaml --workspace workspace
 ```
 
+Immediate path persistence and creation without execution:
+
+```powershell
+gam-app run --config configs/demo.yaml --workspace workspace --run-path-file workspace/latest-run.txt
+gam-app run --config configs/demo.yaml --workspace workspace --create-only
+gam-app run --config configs/demo.yaml --workspace workspace --json
+```
+
+Discover and filter runs in a workspace:
+
+```powershell
+gam-app list-runs --workspace workspace
+gam-app list-runs --workspace workspace --state completed --tag candidate
+gam-app list-runs --workspace workspace --metadata project=bridge-study --json
+```
+
 Monitor or resume:
 
 ```powershell
@@ -434,6 +450,10 @@ gam-app configure `
   --near-duplicate-decimals 8 `
   --near-duplicate-threshold 0.98 `
   --maximum-pairwise-rows 10000 `
+  --tag candidate `
+  --tag grouped `
+  --metadata project=bridge-study `
+  --metadata cohort=2026-q3 `
   --non-interactive
 ```
 
@@ -745,7 +765,54 @@ The user can then choose a smaller preset or adjust the generated configuration 
 
 ---
 
+# 8.1 Experiment Tags and Metadata
+
+Configurations and runs support user-defined tags and key-value metadata under the `experiment` section:
+
+```yaml
+experiment:
+  name: my_experiment
+  primary_metric: log_loss
+  tags:
+    - candidate
+    - grouped
+  metadata:
+    project: bridge-study
+    cohort: 2026-q3
+```
+
+Tags and metadata are validated (tags up to 64 chars, max 32 tags; metadata keys matching `[A-Za-z][A-Za-z0-9_.-]*` and scalar string values up to 256 chars) and persisted in both `config.yaml` and `run.json`.
+
+---
+
 # 9. Run the experiment
+
+`gam-app run` options for automation and path discovery:
+- `--json`: Emits a single machine-readable JSON object with schema `gam_run_creation` to `stdout` immediately upon successful run creation, routing subsequent execution logs to `stderr`.
+- `--create-only`: Initializes the run directory, records `run.json` and `status.json` with `state: "created"`, and exits without starting model fitting.
+- `--run-path-file`: Atomically writes the absolute created run path (with a trailing newline) to a file before execution begins.
+
+---
+
+# 9.1 Run Discovery and Filtering (`gam-app list-runs`)
+
+List and filter runs in a workspace without parsing full configuration or model files:
+
+```powershell
+gam-app list-runs --workspace workspace
+```
+
+Filters (combined using logical AND):
+- `--state`: Single or repeated state choices (`created`, `running`, `paused`, `completed`, `failed`, `cancelled`, `unknown`) (OR logic across states).
+- `--experiment`: Match experiment name.
+- `--strategy`: Filter by validation strategy (`stratified`, `stratified_group`, `time`).
+- `--duplicate-policy`: Filter by duplicate policy (`report`, `error`, `group`).
+- `--model`: Filter by model ID.
+- `--tag`: Searchable tag filter (case-insensitive, AND logic for repeated tags).
+- `--metadata KEY=VALUE`: Filter by metadata equality.
+- `--created-after / --created-before`: ISO 8601 timestamps or YYYY-MM-DD date boundaries in inclusive UTC.
+- `--limit`: Return top N runs (sorting newest first).
+- `--json`: Machine-readable JSON output schema `gam_run_catalog`.
 
 ```powershell
 gam-app run `

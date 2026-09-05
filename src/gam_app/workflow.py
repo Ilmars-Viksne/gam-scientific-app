@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import platform
+import shutil
 import sys
 import uuid
 from dataclasses import dataclass
@@ -50,6 +51,14 @@ from .splitting import (
     raise_for_split_integrity,
     split_integrity_frame,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedRun:
+    run_id: str
+    run_directory: Path
+    metadata_path: Path
+    status_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +256,7 @@ def _persist_split_integrity(
     )
 
 
-def create_run(config_path: Path, workspace: Path) -> Path:
+def create_run_result(config_path: Path, workspace: Path) -> CreatedRun:
     config = load_config(config_path)
 
     timestamp = utc_now().replace(":", "").replace("+00:00", "Z")
@@ -255,34 +264,91 @@ def create_run(config_path: Path, workspace: Path) -> Path:
     run_id = f"run-{timestamp}-{identifier}"
 
     run_directory = workspace / "runs" / run_id
-    store = FileRunStore(run_directory)
-    store.initialize()
-    resolved = dump_config_dict(config)
-    data_hash = sha256_file(config.data_path)
-    config_hash = stable_hash(resolved)
-    write_json_atomic(
-        store.root / "run.json",
-        {
-            "schema_version": config.schema_version,
+
+    try:
+        store = FileRunStore(run_directory)
+        store.initialize()
+        resolved = dump_config_dict(config)
+        data_hash = sha256_file(config.data_path)
+        config_hash = stable_hash(resolved)
+
+        created_at = utc_now()
+        created_run_path = run_directory.resolve().as_posix()
+        created_workspace_path = workspace.resolve().as_posix()
+
+        run_metadata = {
+            "schema_name": "gam_run_metadata",
+            "schema_version": "1.0",
             "run_id": run_id,
-            "created_at_utc": utc_now(),
-            "data_hash": data_hash,
-            "config_hash": config_hash,
+            "created_at_utc": created_at,
+            "created_run_path": created_run_path,
+            "created_workspace_path": created_workspace_path,
             "application_version": __version__,
-        },
-    )
-    write_yaml_atomic(store.root / "config.yaml", resolved)
-    write_json_atomic(
-        store.root / "environment.json",
-        {
-            "python": sys.version,
-            "platform": platform.platform(),
-            "scikit_learn": sklearn.__version__,
-            "pandas": pd.__version__,
-        },
-    )
-    write_json_atomic(store.status_path, {"state": "created", "run_id": run_id})
-    return run_directory
+            "configuration_schema_version": config.schema_version,
+            "experiment": {
+                "name": config.name,
+                "primary_metric": config.primary_metric,
+            },
+            "dataset": {
+                "basename": config.data_path.name,
+                "target": config.target,
+                "data_hash": data_hash,
+                "configured_path": str(config.data_path),
+            },
+            "validation": {
+                "strategy": config.validation.strategy,
+                "outer_splits": config.validation.outer_splits,
+                "outer_repeats": config.validation.outer_repeats,
+                "inner_splits": config.validation.inner_splits,
+                "duplicate_group_policy": config.validation.duplicate_group_policy,
+                "group_column": config.group_column,
+                "time_column": config.time_column,
+            },
+            "models": [model.id for model in config.models],
+            "config_hash": config_hash,
+            "data_hash": data_hash,
+            "tags": list(config.tags),
+            "metadata": {k: config.metadata[k] for k in sorted(config.metadata)},
+        }
+
+        write_json_atomic(
+            store.root / "run.json",
+            run_metadata,
+        )
+        write_yaml_atomic(store.root / "config.yaml", resolved)
+        write_json_atomic(
+            store.root / "environment.json",
+            {
+                "python": sys.version,
+                "platform": platform.platform(),
+                "scikit_learn": sklearn.__version__,
+                "pandas": pd.__version__,
+            },
+        )
+        write_json_atomic(store.status_path, {"state": "created", "run_id": run_id})
+
+        store.event(
+            "run_created",
+            run_id=run_id,
+            run_path=created_run_path,
+            config_hash=config_hash,
+            data_hash=data_hash,
+        )
+
+        return CreatedRun(
+            run_id=run_id,
+            run_directory=run_directory,
+            metadata_path=store.root / "run.json",
+            status_path=store.status_path,
+        )
+    except Exception:
+        if run_directory.exists():
+            shutil.rmtree(run_directory, ignore_errors=True)
+        raise
+
+
+def create_run(config_path: Path, workspace: Path) -> Path:
+    return create_run_result(config_path, workspace).run_directory
 
 
 def execute_run(run_directory: Path) -> None:
