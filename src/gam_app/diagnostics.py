@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -9,8 +10,18 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
-from .config import ExperimentConfig
+from .config import DuplicateGroupConfig, ExperimentConfig
+from .exceptions import DataValidationError
 from .io_utils import write_json_atomic
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateAnalysis:
+    exact_signatures: pd.Series
+    exact_duplicate_groups: pd.DataFrame
+    proper_near_duplicate_groups: pd.DataFrame
+    near_edges: pd.DataFrame
+    conflicting_targets: pd.DataFrame
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +30,8 @@ class StandaloneDiagnosticSettings:
     correlation_warning_threshold: float = 0.90
     minimum_complete_pairs: int = 3
     near_duplicate_decimals: int = 8
+    near_duplicate_threshold: float = 0.98
+    maximum_pairwise_rows: int = 10_000
 
     def validate(self) -> None:
         if not (0.0 <= self.correlation_review_threshold <= 1.0):
@@ -42,6 +55,16 @@ class StandaloneDiagnosticSettings:
 
         if self.near_duplicate_decimals < 0:
             raise ValueError("near_duplicate_decimals cannot be negative.")
+
+        if not math.isfinite(self.near_duplicate_threshold) or not (
+            0.0 < self.near_duplicate_threshold <= 1.0
+        ):
+            raise ValueError(
+                "near_duplicate_threshold must satisfy 0.0 < threshold <= 1.0."
+            )
+
+        if self.maximum_pairwise_rows < 2:
+            raise ValueError("maximum_pairwise_rows must be at least 2.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +102,424 @@ class DerivedRelation:
     correlation_spearman: float | None
     evidence: str
     recommended_action: str
+
+
+class UnionFind:
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+        self.rank = [0] * size
+
+    def find(self, i: int) -> int:
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i: int, j: int) -> None:
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            if self.rank[root_i] < self.rank[root_j]:
+                root_i, root_j = root_j, root_i
+            self.parent[root_j] = root_i
+            if self.rank[root_i] == self.rank[root_j]:
+                self.rank[root_i] += 1
+
+
+def canonicalize_predictors(
+    X: pd.DataFrame,
+    *,
+    decimals: int | None = None,
+) -> pd.DataFrame:
+    canonical = pd.DataFrame(index=X.index)
+
+    for col in X.columns:
+        series = X[col]
+        if pd.api.types.is_numeric_dtype(series):
+            num = pd.to_numeric(series, errors="coerce")
+            if decimals is not None:
+                num = num.round(decimals)
+            num_vals = num.to_numpy(dtype=float)
+            num_vals = np.where(num_vals == -0.0, 0.0, num_vals)
+            formatted = ["MISSING" if np.isnan(v) else (f"{v:.17g}") for v in num_vals]
+            canonical[col] = formatted
+        elif pd.api.types.is_bool_dtype(series):
+            bool_vals = series.to_numpy()
+            formatted = [
+                "MISSING" if pd.isna(v) else ("TRUE" if bool(v) else "FALSE")
+                for v in bool_vals
+            ]
+            canonical[col] = formatted
+        else:
+            str_vals = series.astype("string").str.strip()
+            formatted = ["MISSING" if pd.isna(v) else str(v) for v in str_vals]
+            canonical[col] = formatted
+
+    return canonical
+
+
+def build_exact_predictor_signatures(X: pd.DataFrame) -> pd.Series:
+    canonical = canonicalize_predictors(X, decimals=None)
+    signatures: list[str] = []
+
+    for row in canonical.itertuples(index=False, name=None):
+        raw = json.dumps(
+            list(row),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+
+    return pd.Series(signatures, index=X.index, name="exact_predictor_signature")
+
+
+def exact_duplicate_group_report(
+    X: pd.DataFrame,
+    row_ids: pd.Series,
+) -> pd.DataFrame:
+    signatures = build_exact_predictor_signatures(X)
+    frame = pd.DataFrame(
+        {
+            "row_id": row_ids.astype(str).to_numpy(),
+            "signature": signatures.to_numpy(),
+        }
+    )
+    group_sizes = frame.groupby("signature", sort=False)["row_id"].transform("size")
+    duplicates = frame.loc[group_sizes > 1].copy()
+    if duplicates.empty:
+        return pd.DataFrame(
+            columns=["duplicate_group_id", "signature", "group_size", "row_id"]
+        )
+
+    duplicates["group_size"] = group_sizes.loc[group_sizes > 1].to_numpy()
+
+    # Deterministic group ID based on SHA-256 of sorted member row IDs
+    dup_ids: dict[str, str] = {}
+    for sig, sub in duplicates.groupby("signature", sort=True):
+        sig_str = str(sig)
+        sorted_members = sorted(sub["row_id"].tolist())
+        member_key = "\x1f".join(sorted_members)
+        hash_id = hashlib.sha256(member_key.encode("utf-8")).hexdigest()[:12]
+        dup_ids[sig_str] = f"duplicate_{hash_id}"
+
+    duplicates["duplicate_group_id"] = duplicates["signature"].map(dup_ids)
+
+    return (
+        duplicates[
+            [
+                "duplicate_group_id",
+                "signature",
+                "group_size",
+                "row_id",
+            ]
+        ]
+        .sort_values(["duplicate_group_id", "row_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def conflicting_duplicate_target_report(
+    X: pd.DataFrame,
+    y: pd.Series,
+    row_ids: pd.Series,
+) -> pd.DataFrame:
+    signatures = build_exact_predictor_signatures(X)
+    frame = pd.DataFrame(
+        {
+            "row_id": row_ids.astype(str).to_numpy(),
+            "signature": signatures.to_numpy(),
+            "target": y.astype(str).to_numpy(),
+        }
+    )
+    target_counts = frame.groupby("signature", sort=False)["target"].transform(
+        "nunique"
+    )
+    conflicts = frame.loc[target_counts > 1].copy()
+    if conflicts.empty:
+        return pd.DataFrame(
+            columns=["signature", "target", "row_id", "distinct_target_count"]
+        )
+
+    conflicts["distinct_target_count"] = target_counts[target_counts > 1].to_numpy()
+    return (
+        conflicts[["signature", "target", "row_id", "distinct_target_count"]]
+        .sort_values(["signature", "target", "row_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def build_near_duplicate_signatures(
+    X: pd.DataFrame,
+    *,
+    decimals: int,
+) -> pd.Series:
+    canonical = canonicalize_predictors(X, decimals=decimals)
+    signatures: list[str] = []
+
+    for row in canonical.itertuples(index=False, name=None):
+        raw = json.dumps(
+            list(row),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+
+    return pd.Series(signatures, index=X.index, name="near_duplicate_signature")
+
+
+def duplicate_signature_report(
+    *,
+    signatures: pd.Series,
+    row_ids: pd.Series,
+    report_prefix: str = "near_duplicate",
+) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        {
+            "row_id": row_ids.astype(str).to_numpy(),
+            "signature": signatures.to_numpy(),
+        }
+    )
+    group_sizes = frame.groupby("signature", sort=False)["row_id"].transform("size")
+    duplicates = frame.loc[group_sizes > 1].copy()
+    if duplicates.empty:
+        return pd.DataFrame(
+            columns=[f"{report_prefix}_group_id", "signature", "group_size", "row_id"]
+        )
+
+    duplicates["group_size"] = group_sizes.loc[group_sizes > 1].to_numpy()
+
+    prefix_ids: dict[str, str] = {}
+    for sig, sub in duplicates.groupby("signature", sort=True):
+        sig_str = str(sig)
+        sorted_members = sorted(sub["row_id"].tolist())
+        member_key = "\x1f".join(sorted_members)
+        hash_id = hashlib.sha256(member_key.encode("utf-8")).hexdigest()[:12]
+        prefix_ids[sig_str] = f"{report_prefix}_{hash_id}"
+
+    duplicates[f"{report_prefix}_group_id"] = duplicates["signature"].map(prefix_ids)
+
+    return (
+        duplicates[
+            [
+                f"{report_prefix}_group_id",
+                "signature",
+                "group_size",
+                "row_id",
+            ]
+        ]
+        .sort_values([f"{report_prefix}_group_id", "row_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def analyze_duplicate_groups(
+    X: pd.DataFrame,
+    y: pd.Series,
+    row_ids: pd.Series,
+    config: DuplicateGroupConfig,
+) -> DuplicateAnalysis:
+    row_count = len(X)
+    str_row_ids = row_ids.astype(str).to_numpy()
+
+    # 1. Exact duplicates & conflicting targets
+    exact_signatures = build_exact_predictor_signatures(X)
+    exact_duplicate_groups = exact_duplicate_group_report(X, row_ids)
+    conflicting_targets = conflicting_duplicate_target_report(X, y, row_ids)
+
+    if not config.enabled:
+        empty_near_groups = pd.DataFrame(
+            columns=[
+                "near_duplicate_group_id",
+                "row_id",
+                "exact_signature",
+                "canonical_signature",
+                "group_size",
+                "distinct_exact_signature_count",
+                "matched_column_count",
+                "compared_column_count",
+                "match_fraction",
+                "is_exact_duplicate_member",
+            ]
+        )
+        empty_edges = pd.DataFrame(
+            columns=[
+                "left_row_id",
+                "right_row_id",
+                "matched_column_count",
+                "compared_column_count",
+                "match_fraction",
+                "threshold",
+            ]
+        )
+        return DuplicateAnalysis(
+            exact_signatures=exact_signatures,
+            exact_duplicate_groups=exact_duplicate_groups,
+            proper_near_duplicate_groups=empty_near_groups,
+            near_edges=empty_edges,
+            conflicting_targets=conflicting_targets,
+        )
+
+    # Check pairwise limit
+    if row_count > config.maximum_pairwise_rows:
+        raise DataValidationError(
+            "Near-duplicate analysis requires an exact pairwise scan, "
+            f"but the dataset contains {row_count:,} rows and the configured "
+            f"limit is {config.maximum_pairwise_rows:,}. Increase "
+            "profiling.duplicate_groups.maximum_pairwise_rows only after "
+            "reviewing memory and runtime requirements, or disable "
+            "near-duplicate analysis."
+        )
+
+    # 2. Canonicalize for near duplicates
+    canonical_df = canonicalize_predictors(X, decimals=config.rounding_decimals)
+    canonical_signatures: list[str] = []
+    for row in canonical_df.itertuples(index=False, name=None):
+        raw = json.dumps(
+            list(row),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        canonical_signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+
+    canonical_sig_series = pd.Series(canonical_signatures, index=X.index)
+
+    # 3. Pairwise similarity comparison
+    col_names = list(canonical_df.columns)
+    compared_column_count = len(col_names)
+    matrix = canonical_df.to_numpy(dtype=str)
+
+    uf = UnionFind(row_count)
+    edge_rows: list[dict[str, Any]] = []
+
+    for i in range(row_count):
+        row_i = matrix[i]
+        for j in range(i + 1, row_count):
+            row_j = matrix[j]
+            if compared_column_count == 0:
+                matches = 0
+                fraction = 1.0
+            else:
+                matches = int(np.sum(row_i == row_j))
+                fraction = matches / compared_column_count
+
+            if fraction >= config.near_duplicate_threshold:
+                uf.union(i, j)
+                left_id = str_row_ids[i]
+                right_id = str_row_ids[j]
+                if left_id > right_id:
+                    left_id, right_id = right_id, left_id
+                edge_rows.append(
+                    {
+                        "left_row_id": left_id,
+                        "right_row_id": right_id,
+                        "matched_column_count": matches,
+                        "compared_column_count": compared_column_count,
+                        "match_fraction": fraction,
+                        "threshold": config.near_duplicate_threshold,
+                    }
+                )
+
+    if edge_rows:
+        near_edges = (
+            pd.DataFrame(edge_rows)
+            .drop_duplicates(subset=["left_row_id", "right_row_id"])
+            .sort_values(["left_row_id", "right_row_id"], kind="stable")
+            .reset_index(drop=True)
+        )
+    else:
+        near_edges = pd.DataFrame(
+            columns=[
+                "left_row_id",
+                "right_row_id",
+                "matched_column_count",
+                "compared_column_count",
+                "match_fraction",
+                "threshold",
+            ]
+        )
+
+    # 4. Build connected components & filter proper near duplicate groups
+    component_members: dict[int, list[int]] = {}
+    for idx in range(row_count):
+        root = uf.find(idx)
+        component_members.setdefault(root, []).append(idx)
+
+    # Exact group memberships lookup
+    exact_dups_set = (
+        set(exact_duplicate_groups["row_id"].tolist())
+        if not exact_duplicate_groups.empty
+        else set()
+    )
+
+    proper_near_rows: list[dict[str, Any]] = []
+
+    for root, members in component_members.items():
+        if len(members) < 2:
+            continue
+
+        member_exact_sigs = [exact_signatures.iloc[m] for m in members]
+        distinct_exact_cnt = len(set(member_exact_sigs))
+
+        # A proper near group must contain at least two distinct exact predictor signatures
+        if distinct_exact_cnt < 2:
+            continue
+
+        sorted_member_ids = sorted([str_row_ids[m] for m in members])
+        member_key = "\x1f".join(sorted_member_ids)
+        hash_id = hashlib.sha256(member_key.encode("utf-8")).hexdigest()[:12]
+        group_id = f"near_duplicate_{hash_id}"
+        group_size = len(members)
+
+        for m in members:
+            rid = str_row_ids[m]
+            exact_sig = exact_signatures.iloc[m]
+            canon_sig = canonical_sig_series.iloc[m]
+            is_exact_dup_member = rid in exact_dups_set
+
+            proper_near_rows.append(
+                {
+                    "near_duplicate_group_id": group_id,
+                    "row_id": rid,
+                    "exact_signature": exact_sig,
+                    "canonical_signature": canon_sig,
+                    "group_size": group_size,
+                    "distinct_exact_signature_count": distinct_exact_cnt,
+                    "matched_column_count": compared_column_count,  # Reference context
+                    "compared_column_count": compared_column_count,
+                    "match_fraction": 1.0,  # Group wide indicator
+                    "is_exact_duplicate_member": is_exact_dup_member,
+                }
+            )
+
+    if proper_near_rows:
+        proper_near_duplicate_groups = (
+            pd.DataFrame(proper_near_rows)
+            .sort_values(["near_duplicate_group_id", "row_id"], kind="stable")
+            .reset_index(drop=True)
+        )
+    else:
+        proper_near_duplicate_groups = pd.DataFrame(
+            columns=[
+                "near_duplicate_group_id",
+                "row_id",
+                "exact_signature",
+                "canonical_signature",
+                "group_size",
+                "distinct_exact_signature_count",
+                "matched_column_count",
+                "compared_column_count",
+                "match_fraction",
+                "is_exact_duplicate_member",
+            ]
+        )
+
+    return DuplicateAnalysis(
+        exact_signatures=exact_signatures,
+        exact_duplicate_groups=exact_duplicate_groups,
+        proper_near_duplicate_groups=proper_near_duplicate_groups,
+        near_edges=near_edges,
+        conflicting_targets=conflicting_targets,
+    )
 
 
 def numeric_predictor_frame(
@@ -355,148 +796,6 @@ def save_correlation_analysis(
         directory / "numeric_predictor_dictionary.csv",
         index=False,
     )
-
-
-# Exact & Near Duplicate Diagnostics
-
-
-def build_exact_predictor_signatures(X: pd.DataFrame) -> pd.Series:
-    normalized = X.copy()
-    for name in normalized.columns:
-        series = normalized[name]
-        if pd.api.types.is_numeric_dtype(series):
-            normalized[name] = pd.to_numeric(series, errors="coerce").astype("Float64")
-        else:
-            normalized[name] = series.astype("string")
-
-    signatures: list[str] = []
-    for row in normalized.itertuples(index=False, name=None):
-        payload = [None if pd.isna(value) else value for value in row]
-        raw = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
-        signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
-
-    return pd.Series(signatures, index=X.index, name="exact_predictor_signature")
-
-
-def exact_duplicate_group_report(
-    X: pd.DataFrame,
-    row_ids: pd.Series,
-) -> pd.DataFrame:
-    signatures = build_exact_predictor_signatures(X)
-    frame = pd.DataFrame(
-        {
-            "row_id": row_ids.astype(str).to_numpy(),
-            "signature": signatures.to_numpy(),
-        }
-    )
-    group_sizes = frame.groupby("signature", sort=False)["row_id"].transform("size")
-    duplicates = frame.loc[group_sizes > 1].copy()
-    if duplicates.empty:
-        return pd.DataFrame(
-            columns=["duplicate_group_id", "signature", "group_size", "row_id"]
-        )
-
-    duplicates["group_size"] = group_sizes.loc[group_sizes > 1].to_numpy()
-    duplicates["duplicate_group_id"] = "duplicate_" + duplicates.groupby(
-        "signature", sort=True
-    ).ngroup().add(1).astype(str).str.zfill(6)
-
-    return duplicates[
-        [
-            "duplicate_group_id",
-            "signature",
-            "group_size",
-            "row_id",
-        ]
-    ].sort_values(["duplicate_group_id", "row_id"], kind="stable")
-
-
-def conflicting_duplicate_target_report(
-    X: pd.DataFrame,
-    y: pd.Series,
-    row_ids: pd.Series,
-) -> pd.DataFrame:
-    signatures = build_exact_predictor_signatures(X)
-    frame = pd.DataFrame(
-        {
-            "row_id": row_ids.astype(str).to_numpy(),
-            "signature": signatures.to_numpy(),
-            "target": y.astype(str).to_numpy(),
-        }
-    )
-    target_counts = frame.groupby("signature", sort=False)["target"].transform(
-        "nunique"
-    )
-    conflicts = frame.loc[target_counts > 1].copy()
-    if conflicts.empty:
-        return pd.DataFrame(
-            columns=["signature", "target", "row_id", "distinct_target_count"]
-        )
-
-    conflicts["distinct_target_count"] = target_counts[target_counts > 1].to_numpy()
-    return conflicts[
-        ["signature", "target", "row_id", "distinct_target_count"]
-    ].sort_values(["signature", "target", "row_id"], kind="stable")
-
-
-def build_near_duplicate_signatures(
-    X: pd.DataFrame,
-    *,
-    decimals: int,
-) -> pd.Series:
-    normalized = X.copy()
-    for name in normalized.columns:
-        if pd.api.types.is_numeric_dtype(normalized[name]):
-            normalized[name] = (
-                pd.to_numeric(normalized[name], errors="coerce")
-                .round(decimals)
-                .astype("Float64")
-            )
-        else:
-            normalized[name] = normalized[name].astype("string").str.strip()
-
-    return build_exact_predictor_signatures(normalized).rename(
-        "near_duplicate_signature"
-    )
-
-
-def duplicate_signature_report(
-    *,
-    signatures: pd.Series,
-    row_ids: pd.Series,
-    report_prefix: str = "near_duplicate",
-) -> pd.DataFrame:
-    frame = pd.DataFrame(
-        {
-            "row_id": row_ids.astype(str).to_numpy(),
-            "signature": signatures.to_numpy(),
-        }
-    )
-    group_sizes = frame.groupby("signature", sort=False)["row_id"].transform("size")
-    duplicates = frame.loc[group_sizes > 1].copy()
-    if duplicates.empty:
-        return pd.DataFrame(
-            columns=[f"{report_prefix}_group_id", "signature", "group_size", "row_id"]
-        )
-
-    duplicates["group_size"] = group_sizes.loc[group_sizes > 1].to_numpy()
-    duplicates[f"{report_prefix}_group_id"] = f"{report_prefix}_" + duplicates.groupby(
-        "signature", sort=True
-    ).ngroup().add(1).astype(str).str.zfill(6)
-
-    return duplicates[
-        [
-            f"{report_prefix}_group_id",
-            "signature",
-            "group_size",
-            "row_id",
-        ]
-    ].sort_values([f"{report_prefix}_group_id", "row_id"], kind="stable")
 
 
 # Suspected Derived Relations
@@ -841,90 +1140,6 @@ def _build_standalone_high_correlation_pairs(
     )
 
 
-def _row_signatures(frame: pd.DataFrame) -> pd.Series:
-    signatures: list[str] = []
-
-    for row in frame.itertuples(index=False, name=None):
-        values = [None if pd.isna(value) else value for value in row]
-        serialized = json.dumps(
-            values,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
-        signatures.append(hashlib.sha256(serialized.encode("utf-8")).hexdigest())
-
-    return pd.Series(signatures, index=frame.index, name="signature")
-
-
-def _normalized_signature_frame(
-    predictors: pd.DataFrame,
-    *,
-    decimals: int | None,
-) -> pd.DataFrame:
-    normalized = predictors.copy()
-
-    for column in normalized.columns:
-        series = normalized[column]
-        if pd.api.types.is_numeric_dtype(series):
-            numeric = pd.to_numeric(series, errors="coerce")
-            if decimals is not None:
-                numeric = numeric.round(decimals)
-            normalized[column] = numeric.astype("Float64")
-        else:
-            normalized[column] = series.astype("string").str.strip()
-
-    return normalized
-
-
-def _duplicate_group_report(
-    *,
-    signatures: pd.Series,
-    row_ids: pd.Series,
-    group_prefix: str,
-) -> pd.DataFrame:
-    membership = pd.DataFrame(
-        {
-            "row_id": row_ids.astype(str).to_numpy(),
-            "signature": signatures.to_numpy(),
-        }
-    )
-
-    sizes = membership.groupby("signature", sort=False)["row_id"].transform("size")
-
-    duplicates = membership.loc[sizes > 1].copy()
-
-    if duplicates.empty:
-        return pd.DataFrame(
-            columns=[
-                f"{group_prefix}_group_id",
-                "signature",
-                "group_size",
-                "row_id",
-            ]
-        )
-
-    duplicates["group_size"] = sizes.loc[sizes > 1].to_numpy()
-
-    group_name = f"{group_prefix}_group_id"
-
-    duplicates[group_name] = (
-        group_prefix
-        + "_"
-        + duplicates.groupby("signature", sort=True)
-        .ngroup()
-        .add(1)
-        .astype(str)
-        .str.zfill(6)
-    )
-
-    return (
-        duplicates[[group_name, "signature", "group_size", "row_id"]]
-        .sort_values([group_name, "row_id"], kind="stable")
-        .reset_index(drop=True)
-    )
-
-
 def calculate_standalone_diagnostics(
     *,
     frame: pd.DataFrame,
@@ -992,64 +1207,19 @@ def calculate_standalone_diagnostics(
 
     numeric_dictionary = pd.DataFrame(dictionary_rows)
 
-    exact_normalized = _normalized_signature_frame(
-        predictors,
-        decimals=None,
+    duplicate_config = DuplicateGroupConfig(
+        enabled=True,
+        rounding_decimals=settings.near_duplicate_decimals,
+        near_duplicate_threshold=settings.near_duplicate_threshold,
+        maximum_pairwise_rows=settings.maximum_pairwise_rows,
     )
 
-    exact_signatures = _row_signatures(exact_normalized)
-
-    exact_duplicates = _duplicate_group_report(
-        signatures=exact_signatures,
+    analysis = analyze_duplicate_groups(
+        X=predictors,
+        y=frame[target],
         row_ids=row_ids,
-        group_prefix="duplicate",
+        config=duplicate_config,
     )
-
-    near_normalized = _normalized_signature_frame(
-        predictors,
-        decimals=settings.near_duplicate_decimals,
-    )
-
-    near_signatures = _row_signatures(near_normalized)
-
-    near_duplicates = _duplicate_group_report(
-        signatures=near_signatures,
-        row_ids=row_ids,
-        group_prefix="near_duplicate",
-    )
-
-    conflict_frame = pd.DataFrame(
-        {
-            "row_id": row_ids.astype(str).to_numpy(),
-            "signature": exact_signatures.to_numpy(),
-            "target": frame[target].astype(str).to_numpy(),
-        }
-    )
-
-    distinct_targets = conflict_frame.groupby("signature", sort=False)[
-        "target"
-    ].transform("nunique")
-
-    conflicts = conflict_frame.loc[distinct_targets > 1].copy()
-
-    if conflicts.empty:
-        conflicts = pd.DataFrame(
-            columns=[
-                "row_id",
-                "signature",
-                "target",
-                "distinct_target_count",
-            ]
-        )
-    else:
-        conflicts["distinct_target_count"] = distinct_targets.loc[
-            distinct_targets > 1
-        ].to_numpy()
-
-        conflicts = conflicts.sort_values(
-            ["signature", "target", "row_id"],
-            kind="stable",
-        ).reset_index(drop=True)
 
     suspected_relations = pd.DataFrame(
         columns=[
@@ -1075,9 +1245,9 @@ def calculate_standalone_diagnostics(
         high_correlation_pairs=high_pairs,
         numeric_predictor_dictionary=numeric_dictionary,
         suspected_derived_relations=suspected_relations,
-        exact_duplicate_groups=exact_duplicates,
-        near_duplicate_groups=near_duplicates,
-        conflicting_duplicate_targets=conflicts,
+        exact_duplicate_groups=analysis.exact_duplicate_groups,
+        near_duplicate_groups=analysis.proper_near_duplicate_groups,
+        conflicting_duplicate_targets=analysis.conflicting_targets,
     )
 
 

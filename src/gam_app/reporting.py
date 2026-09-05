@@ -88,17 +88,49 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
             "individual term attribution is not unique.</em></p>"
         )
 
+        sections.append("<h3>Duplicate predictor groups</h3>")
         exact_duplicates_path = diagnostics_dir / "exact_duplicate_groups.csv"
+        exact_count = 0
         if exact_duplicates_path.exists():
             exact_duplicates = pd.read_csv(exact_duplicates_path)
-            has_col = "duplicate_group_id" in exact_duplicates.columns
-            duplicate_group_count = (
-                exact_duplicates["duplicate_group_id"].nunique()
-                if not exact_duplicates.empty and has_col
-                else 0
-            )
-            sections.append("<h3>Duplicate predictor groups</h3>")
-            sections.append(f"<p>Exact duplicate groups: {duplicate_group_count}</p>")
+            if (
+                not exact_duplicates.empty
+                and "duplicate_group_id" in exact_duplicates.columns
+            ):
+                exact_count = int(exact_duplicates["duplicate_group_id"].nunique())
+
+        near_duplicates_path = diagnostics_dir / "near_duplicate_groups.csv"
+        near_count = 0
+        if near_duplicates_path.exists():
+            near_duplicates = pd.read_csv(near_duplicates_path)
+            if (
+                not near_duplicates.empty
+                and "near_duplicate_group_id" in near_duplicates.columns
+            ):
+                near_count = int(near_duplicates["near_duplicate_group_id"].nunique())
+
+        conflicting_path = diagnostics_dir / "conflicting_duplicate_targets.csv"
+        conflicting_count = 0
+        if conflicting_path.exists():
+            conflicting_duplicates = pd.read_csv(conflicting_path)
+            if (
+                not conflicting_duplicates.empty
+                and "signature" in conflicting_duplicates.columns
+            ):
+                conflicting_count = int(conflicting_duplicates["signature"].nunique())
+
+        sections.append(
+            f"<p><strong>Duplicate policy:</strong> {html.escape(config.validation.duplicate_group_policy)}</p>"
+        )
+        sections.append(
+            f"<p><strong>Exact duplicate groups:</strong> {exact_count}</p>"
+        )
+        sections.append(
+            f"<p><strong>Proper near-duplicate groups:</strong> {near_count}</p>"
+        )
+        sections.append(
+            f"<p><strong>Conflicting duplicate targets:</strong> {conflicting_count}</p>"
+        )
 
         diagnostic_links = [
             '<li><a href="../diagnostics/correlation_pearson.csv">'
@@ -112,7 +144,11 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
             '<li><a href="../diagnostics/exact_duplicate_groups.csv">'
             "Exact duplicate groups</a></li>",
             '<li><a href="../diagnostics/near_duplicate_groups.csv">'
-            "Candidate near-duplicate groups</a></li>",
+            "Proper near-duplicate groups</a></li>",
+            '<li><a href="../diagnostics/near_duplicate_edges.csv">'
+            "Near-duplicate edge evidence</a></li>",
+            '<li><a href="../diagnostics/effective_validation_groups.csv">'
+            "Effective validation groups</a></li>",
             '<li><a href="../diagnostics/conflicting_duplicate_targets.csv">'
             "Conflicting duplicate targets</a></li>",
             '<li><a href="../diagnostics/suspected_derived_relations.csv">'
