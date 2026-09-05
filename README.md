@@ -1,235 +1,16 @@
 # GAM Scientific App
 
-A standalone, file-based, configuration-driven CLI for reproducible multiclass
-Generalized Additive Model experiments on tabular datasets.
+A standalone, file-based, configuration-driven command-line application for
+reproducible binary and multiclass classification with penalized generalized
+additive models on tabular data.
 
-## Capabilities
+The application supports ordinary stratified, group-aware, and time-aware
+nested validation; predictor and duplicate diagnostics; resumable run
+execution; machine-readable artifacts; HTML reporting; model inspection;
+batch prediction; run comparison; and run discovery without requiring a
+database or external service.
 
-- CSV, TSV, and Parquet input
-- automatic profiling and role recommendations
-- interactive or non-interactive configuration generation
-- main-effect and tensor-product pairwise GAM-style models
-- repeated nested stratified cross-validation
-- deterministic split manifests shared by all models
-- fold-level checkpoints, pause, cancel, and resume
-- out-of-fold probabilities and class metrics
-- final fitted models, exact transformed-space coefficients, and equations
-- confusion matrices and HTML reports
-- transformed-space component and equation exports
-- comparison of runs with paired fold differences
-- batch prediction with input-schema validation
-- no database or external service
-
----
-
-## Quick start
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-```
-
-Create demonstration data:
-
-```powershell
-gam-app demo --output examples/demo.csv
-```
-
-Profile it:
-
-```powershell
-gam-app profile --data examples/demo.csv --target Y --output profile
-```
-
-Create a configuration without editing Python:
-
-```powershell
-gam-app configure --data examples/demo.csv --target Y --output configs/demo.yaml
-```
-
-For unattended configuration, accept inferred roles and the standard preset:
-
-```powershell
-gam-app configure --data examples/demo.csv --target Y --output configs/demo.yaml --non-interactive
-```
-
-Validate and estimate the work:
-
-```powershell
-gam-app plan --config configs/demo.yaml
-```
-
-Check feasibility in machine-readable JSON format:
-
-```powershell
-gam-app plan --config configs/demo.yaml --json
-```
-
-Migrate a legacy configuration (e.g., schema 1.0 to 1.1):
-
-```powershell
-gam-app migrate-config --input configs/legacy.yaml --output configs/current.yaml
-```
-
-Run:
-
-```powershell
-gam-app run --config configs/demo.yaml --workspace workspace
-```
-
-Immediate path persistence and creation without execution:
-
-```powershell
-gam-app run --config configs/demo.yaml --workspace workspace --run-path-file workspace/latest-run.txt
-gam-app run --config configs/demo.yaml --workspace workspace --create-only
-gam-app run --config configs/demo.yaml --workspace workspace --json
-```
-
-Discover and filter runs in a workspace:
-
-```powershell
-gam-app list-runs --workspace workspace
-gam-app list-runs --workspace workspace --state completed --tag candidate
-gam-app list-runs --workspace workspace --metadata project=bridge-study --json
-```
-
-Monitor or resume:
-
-```powershell
-gam-app status --run workspace/runs/<run-id>
-gam-app status --run workspace/runs/<run-id> --follow
-gam-app pause --run workspace/runs/<run-id>
-gam-app resume --run workspace/runs/<run-id>
-gam-app cancel --run workspace/runs/<run-id>
-```
-
-Inspect and predict:
-
-```powershell
-gam-app inspect --run workspace/runs/<run-id> --model gam_main
-gam-app predict --model workspace/runs/<run-id>/models/gam_main/model.joblib --input new.csv --output predictions.csv
-```
-
-Compare two completed runs or model results:
-
-```powershell
-gam-app compare --left workspace/runs/<run-a> --left-model gam_main --right workspace/runs/<run-b> --right-model gam_pairwise --output comparison
-```
-
-## Configuration
-
-The generated YAML is a complete experiment contract. Users can change it through
-`gam-app configure`; no source-code edits are required. A resolved immutable copy
-is stored with each run.
-
-Feature roles:
-
-- `smooth`: univariate B-spline effect
-- `linear`: standardized linear effect
-- `categorical`: one-hot categorical effect
-- `exclude`: omit from modelling
-
-Interaction modes:
-
-- `none`
-- `all_eligible`
-- `explicit`
-
-The application currently targets multiclass classification. Binary targets also
-work through scikit-learn logistic regression, but multiclass is the validated
-primary use case.
-
-## Run directory
-
-Each run is self-contained:
-
-```text
-run-id/
-├── run.json
-├── config.yaml
-├── data_manifest.json
-├── split_manifest.csv
-├── status.json
-├── events.jsonl
-├── control/
-├── checkpoints/
-├── results/
-├── models/
-├── plots/
-├── reports/
-└── logs/
-```
-
-`status.json` is atomically replaced. `events.jsonl` is append-only. A fold
-checkpoint is reusable only when its `COMPLETE` marker exists and its dataset and
-configuration hashes match the run.
-
-## Development
-
-```powershell
-ruff format --check .
-ruff check .
-mypy src
-pytest --cov=gam_app --cov-report=term-missing
-```
-
-The unit tests use small synthetic datasets. The demonstration dataset is used by
-end-to-end smoke and regression tests, not by every unit test.
-
-## Scientific interpretation
-
-This implementation creates penalized multinomial logistic additive B-spline
-models. The inverse link is softmax. Coefficients are predictive regularized
-components, not causal estimates or classical unregularized significance tests.
-Tensor-product interaction blocks are included only with their constituent main
-effects. Raw interaction blocks should be interpreted cautiously unless further
-functional-ANOVA centering is implemented.
-
-## Security
-
-Only load `.joblib` models created by a trusted installation. Joblib is
-pickle-based. The application records package versions and model metadata, but a
-serialized Python object is not a safe interchange format for untrusted files.
-
----
-
-## Included project structure
-
-```text
-gam-scientific-app/
-├── pyproject.toml
-├── README.md
-├── .gitignore
-├── examples/
-│   └── quick-demo.yaml
-├── src/
-│   └── gam_app/
-│       ├── __init__.py
-│       ├── cli.py
-│       ├── config.py
-│       ├── data.py
-│       ├── evaluation.py
-│       ├── exceptions.py
-│       ├── inspection.py
-│       ├── io_utils.py
-│       ├── models.py
-│       ├── reporting.py
-│       ├── run_store.py
-│       ├── transformers.py
-│       └── workflow.py
-└── tests/
-    ├── conftest.py
-    ├── test_model.py
-    ├── test_splits.py
-    └── test_transformers.py
-```
-
----
-
-# 1. Installation
-
-Extract the ZIP file and open the resulting directory in VS Code.
+## Installation
 
 Create and activate a virtual environment:
 
@@ -248,589 +29,159 @@ python -m pip install -e ".[dev]"
 Verify installation:
 
 ```powershell
-gam-app --help
+poetry run gam-app --help
 ```
 
----
+## Quick start
 
-# 2. Complete user workflow
-
-## Step 1 — Register or select a dataset
-
-The application supports:
-
-- CSV;
-- TSV;
-- Parquet.
-
-A dataset should have:
-
-- one categorical classification target;
-- at least two target classes;
-- one or more predictor columns;
-- no missing target values.
-
-The predictor names are arbitrary. Nothing is hard-coded to `X1`, `X2`, or `Y`.
-
----
-
-## Step 2 — Profile the dataset
+Create demonstration data:
 
 ```powershell
-gam-app profile `
-  --data data/my_dataset.csv `
-  --target outcome `
-  --output profile
+poetry run gam-app demo `
+  --output examples/demo.csv
 ```
 
-This generates:
-
-```text
-profile/
-├── profile.json
-└── columns.csv
-```
-
-The profile contains:
-
-- row and column counts;
-- target class distribution;
-- data types;
-- missing-value counts;
-- unique-value counts;
-- numerical ranges;
-- common categorical values;
-- duplicate-row count;
-- recommended feature roles;
-- explanations for recommendations;
-- dataset SHA-256 hash.
-
----
-
-## Step 3 — Create the model configuration
-
-### Interactive configuration
+Create a configuration:
 
 ```powershell
-gam-app configure `
-  --data data/my_dataset.csv `
-  --target outcome `
-  --output configs/my_experiment.yaml
-```
-
-For each predictor, the application shows:
-
-- inferred type;
-- number of unique values;
-- recommended role;
-- reason for the recommendation.
-
-The user chooses among:
-
-```text
-smooth
-linear
-categorical
-exclude
-```
-
-No Python editing is required.
-
-### Unattended configuration
-
-To accept automatic recommendations:
-
-```powershell
-gam-app configure `
-  --data data/my_dataset.csv `
-  --target outcome `
-  --output configs/my_experiment.yaml `
-  --preset standard `
+poetry run gam-app configure `
+  --data examples/demo.csv `
+  --target Y `
+  --output configs/demo.yaml `
+  --preset quick `
   --non-interactive
 ```
 
-Available search presets:
-
-```text
-quick
-standard
-thorough
-```
-
----
-
-# 3. Configuration-driven modelling
-
-The generated YAML file is the complete experiment contract.
-
-Example (Schema 1.1):
-
-```yaml
-schema_version: "1.1"
-
-experiment:
-  name: my_experiment
-  primary_metric: log_loss
-
-data:
-  path: C:/data/my_dataset.csv
-  target: outcome
-  row_id: id
-  group: batch_id
-  time: null
-
-features:
-  id:
-    role: exclude
-  batch_id:
-    role: exclude
-  temperature:
-    role: smooth
-    missing: error
-  pressure:
-    role: smooth
-    missing: median
-
-models:
-  - id: gam_main
-    interactions: none
-
-validation:
-  strategy: stratified_group
-  outer_splits: 5
-  outer_repeats: 3
-  inner_splits: 5
-  random_state: 42
-  gap: 0
-  test_size: null
-  duplicate_group_policy: group
-
-profiling:
-  correlation:
-    enabled: true
-    pearson: true
-    spearman: true
-    review_threshold: 0.75
-    warning_threshold: 0.90
-    minimum_complete_pairs: 3
-  duplicate_groups:
-    enabled: true
-    rounding_decimals: 8
-    near_duplicate_threshold: 0.98
-    maximum_pairwise_rows: 10000
-    include_target_in_signature: false
-
-search:
-  n_knots: [3, 4, 5]
-  degree: [2, 3]
-  C: [0.01, 0.1, 1.0, 10.0]
-  interaction_scale: [0.5, 1.0]
-
-execution:
-  workers: 1
-  checkpoint_unit: outer_fold
-  stop_on_convergence_warning: true
-```
-
-### Advanced `configure` Options
-
-`gam-app configure` accepts arguments to explicitly set validation design and profiling rules:
+Check validation feasibility:
 
 ```powershell
-gam-app configure `
-  --data data/observations.csv `
-  --target outcome `
-  --output configs/grouped.yaml `
-  --group batch_id `
-  --validation-strategy stratified_group `
-  --duplicate-group-policy group `
-  --outer-splits 5 `
-  --outer-repeats 3 `
-  --inner-splits 5 `
-  --near-duplicate-decimals 8 `
-  --near-duplicate-threshold 0.98 `
-  --maximum-pairwise-rows 10000 `
-  --tag candidate `
-  --tag grouped `
-  --metadata project=bridge-study `
-  --metadata cohort=2026-q3 `
-  --non-interactive
+poetry run gam-app plan `
+  --config configs/demo.yaml
 ```
 
-For time-aware validation:
+Run the experiment and persist its path:
 
 ```powershell
-gam-app configure `
-  --data data/events.csv `
-  --target outcome `
-  --output configs/temporal.yaml `
-  --time observed_at `
-  --validation-strategy time `
-  --outer-splits 5 `
-  --outer-repeats 1 `
-  --gap 10 `
-  --test-size 20 `
-  --non-interactive
+poetry run gam-app run `
+  --config configs/demo.yaml `
+  --workspace workspace `
+  --run-path-file workspace/latest-run.txt
 ```
 
-Key arguments:
-- Validation design: `--outer-splits`, `--outer-repeats`, `--inner-splits`, `--random-state`, `--test-size`, `--duplicate-group-policy` (`report`, `error`, `group`), `--validation-strategy` (`stratified`, `stratified_group`, `time`), `--gap`.
-- Profiling controls: `--review-correlation`, `--warn-correlation`, `--minimum-complete-pairs`, `--near-duplicate-decimals`, `--near-duplicate-threshold`, `--maximum-pairwise-rows`.
-- Toggles: `--duplicate-groups` / `--no-duplicate-groups`, `--correlation-diagnostics` / `--no-correlation-diagnostics`.
-
-### Reserved Data-Role Columns
-
-Columns configured under `data` (`target`, `row_id`, `group`, `time`) are reserved data roles.
-- Reserved role columns must be distinct (e.g. the same column cannot serve as both `row_id` and `group`).
-- Reserved role columns cannot be active model predictors. In `features`, their role must be set to `exclude` or they must be omitted.
-
-### Schema Migration (`gam-app migrate-config`)
-
-The current configuration schema version is `1.1`. Legacy schema version `1.0` files remain supported for compatibility.
-To upgrade a schema version 1.0 configuration file:
-
-```powershell
-gam-app migrate-config `
-  --input configs/legacy.yaml `
-  --output configs/current.yaml
-```
-
-Migration adds behavior-preserving defaults (such as `validation.strategy: stratified`, `validation.gap: 0`, and profiling blocks) and rebases relative dataset paths relative to the output directory. It validates the configuration structure before writing and will not overwrite files without `--overwrite`.
-
----
-
-# 8. Data-Dependent Feasibility Checks (`gam-app plan`)
+For the audited Windows PowerShell workflow, including exit-code handling, JSON output, run-path recovery, profiling, grouped validation, time-aware validation, inspection, contributions, and prediction, see `docs/powershell-workflow.md`.
+
+## Capabilities
+
+### Data and configuration
+
+- CSV, TSV, and Parquet input
+- categorical classification targets
+- numeric and categorical predictors
+- dataset profiling and feature-role recommendations
+- interactive and noninteractive configuration generation
+- versioned YAML configuration
+- configuration migration from supported legacy schemas
+- experiment tags and searchable key-value metadata
+
+### Modelling
+
+- penalized logistic additive models
+- smooth B-spline terms
+- standardized linear terms
+- one-hot categorical terms
+- excluded source columns
+- main-effects models
+- explicit or all-eligible smooth-by-smooth tensor-product interactions
+- hyperparameter search inside nested validation
+
+### Validation
+
+- repeated nested stratified cross-validation
+- group-aware stratified validation
+- forward time-aware validation
+- deterministic persisted outer split manifests
+- configured scientific groups
+- duplicate-derived effective validation groups
+- validation-feasibility checks before execution
+- persisted split-integrity diagnostics
+
+### Predictor diagnostics
+
+- Pearson and Spearman correlation matrices
+- ranked high-correlation pair reports
+- predictor data dictionary
+- declared and suspected derived-variable metadata
+- exact duplicate groups
+- proper near-duplicate groups
+- conflicting duplicate-target detection
+- duplicate policies: report, error, and group
+- schema-versioned diagnostic manifests
+- artifact row counts, byte counts, and SHA-256 hashes
+
+### Execution and reproducibility
+
+- unique self-contained run directories
+- dataset and configuration hashes
+- environment and application-version metadata
+- fold-level checkpoints
+- pause, resume, and cancel controls
+- immediate run-path return or persistence
+- append-only event history
+- atomic status updates
+- workspace run discovery and metadata filtering
+
+### Results and interpretation
+
+- out-of-fold probabilities
+- fold and aggregate classification metrics
+- confusion matrices
+- final fitted models
+- transformed-space component exports
+- exact transformed-space score equations
+- reference-class equation exports
+- link-function verification
+- observation-level contribution exports
+- grouped contribution summaries
+- comparison of paired fold results
+- batch prediction with input-schema validation
+- HTML reports with validation and diagnostic summaries
+
+## Validation strategies
+
+Use the strategy that matches how the trained model will encounter future observations.
+
+- `stratified`: use when observations can reasonably be treated as independent and class proportions should be preserved.
+- `stratified_group`: use when related observations must remain together, such as observations from the same specimen, site, batch, participant, or duplicate-derived component.
+- `time`: use when prediction is forward-looking and training observations must precede test observations.
+
+Run `gam-app plan` before execution. It checks whether the configured dataset can support the requested outer and inner validation design.
+
+For scientific background and guidance on selecting validation strategies, see `docs/scientific-interpretation.md`.
+
+## Configuration
+
+The generated YAML file is a complete, versioned experiment contract (current schema version 1.1). Users can modify configuration through `gam-app configure` or by editing the file directly; no source code changes are required.
+
+Feature roles:
+- `smooth`: univariate B-spline effect
+- `linear`: standardized linear effect
+- `categorical`: one-hot categorical effect
+- `exclude`: omit column from active predictors
+
+Interaction modes:
+- `none`: main effects only
+- `all_eligible`: all pairs among smooth predictors
+- `explicit`: explicitly configured smooth-smooth predictor pairs
 
-`gam-app plan` verifies whether the configured validation design is feasible for the target dataset before fits are estimated:
+Reserved data-role columns:
+- Columns configured under `data` (`target`, `row_id`, `group`, `time`) serve dedicated data roles and cannot be active model predictors. They must be set to `role: exclude` in `features` or omitted.
 
-```powershell
-gam-app plan --config configs/my_experiment.yaml
-```
+Schema migration:
+- Upgrade legacy schema 1.0 configurations using `poetry run gam-app migrate-config --input configs/legacy.yaml --output configs/current.yaml`.
 
-Or for machine-readable JSON output:
+## Runs and outputs
 
-```powershell
-gam-app plan --config configs/my_experiment.yaml --json
-```
-
-Feasibility checks evaluate:
-- Required columns exist in the dataset.
-- Target column has no missing values and contains at least 2 classes.
-- Stratified class support across outer and inner splits.
-- Effective group counts and class-group support (including duplicate-derived groups if policy is `group`).
-- Temporal window feasibility and timestamps parseability.
-- Near-duplicate scanning row limits.
-
-Exit behavior:
-- Exit code `0`: Plan is feasible. Fit estimation table is printed.
-- Exit code `2`: Validation design is not feasible for the dataset. All evaluated pass/fail/warning checks and an actionable failure summary are displayed, and fit estimates are omitted.
-
-experiment:
-  name: my_experiment
-  primary_metric: log_loss
-
-data:
-  path: C:/data/my_dataset.csv
-  target: outcome
-  row_id: null
-
-features:
-  temperature:
-    role: smooth
-    missing: error
-
-  pressure:
-    role: smooth
-    missing: median
-
-  operating_mode:
-    role: categorical
-    missing: most_frequent
-    categories:
-      - low
-      - standard
-      - high
-
-  calibration:
-    role: linear
-    missing: error
-
-models:
-  - id: gam_main
-    interactions: none
-
-  - id: gam_pairwise
-    interactions: all_eligible
-
-validation:
-  outer_splits: 5
-  outer_repeats: 3
-  inner_splits: 5
-  random_state: 42
-
-search:
-  n_knots:
-    - 3
-    - 4
-    - 5
-
-  degree:
-    - 2
-    - 3
-
-  C:
-    - 0.01
-    - 0.1
-    - 1.0
-    - 10.0
-
-  interaction_scale:
-    - 0.5
-    - 1.0
-
-execution:
-  workers: 1
-  checkpoint_unit: outer_fold
-  stop_on_convergence_warning: true
-```
-
-Users can generate this configuration through the CLI wizard. Advanced users may also edit or version the YAML without changing application code.
-
----
-
-# 4. Supported predictor roles
-
-## Smooth
-
-```yaml
-role: smooth
-```
-
-The predictor receives a univariate B-spline effect:
-
-$$
-f_{jk}(x_j) = \sum_m \theta_{jkm} B_{jm}(x_j).
-$$
-
-## Linear
-
-```yaml
-role: linear
-```
-
-The predictor is standardized inside every training fold and enters as:
-
-$$
-\beta_{jk}
-\frac{x_j-\mu_j}{\sigma_j}.
-$$
-
-## Categorical
-
-```yaml
-role: categorical
-```
-
-The predictor is one-hot encoded with a reference level.
-
-## Excluded
-
-```yaml
-role: exclude
-```
-
-The predictor remains in the source dataset but is not passed to the model.
-
----
-
-# 5. Missing-value policies
-
-Each variable can use one of these policies:
-
-```yaml
-missing: error
-```
-
-Reject missing values.
-
-```yaml
-missing: median
-```
-
-Use training-fold median imputation.
-
-```yaml
-missing: most_frequent
-```
-
-Use training-fold most-frequent-value imputation.
-
-All fitted preprocessing occurs inside the model pipeline and is learned from training data only.
-
----
-
-# 6. Model types
-
-## Main-effects GAM
-
-```yaml
-- id: gam_main
-  interactions: none
-```
-
-The class score has the general form:
-
-$$
-\eta_k(\mathbf{x}) =
-\beta_{0k}
-+\sum_j f_{jk}(x_j)
-+\sum_l \beta_{lk}\widetilde{x}_l
-+\sum_c \gamma_{ck}(x_c).
-$$
-
-## All-eligible pairwise GAM
-
-```yaml
-- id: gam_pairwise
-  interactions: all_eligible
-```
-
-Every pair among smooth predictors is included:
-
-$$
-\eta_k(\mathbf{x}) =
-\beta_{0k}
-+\sum_j f_{jk}(x_j)
-+\sum_{(r,s)} f_{rsk}(x_r,x_s).
-$$
-
-## Explicit pairs
-
-The application model layer also supports explicitly configured pairs:
-
-```yaml
-- id: gam_selected_pairs
-  interactions: explicit
-  pairs:
-    - [temperature, pressure]
-    - [load, humidity]
-```
-
-The system validates that both members are distinct configured predictors.
-
----
-
-# 7. Link function
-
-Both model types use:
-
-- multinomial response;
-- multinomial-logit link;
-- softmax inverse link;
-- L2-penalized multinomial log loss.
-
-Class probabilities are:
-
-$$
-P(Y=k\mid\mathbf{x}) =
-\frac{\exp(\eta_k)}
-{\sum_{\ell}\exp(\eta_\ell)}.
-$$
-
----
-
-# 8. Preview the execution plan
-
-Before starting an expensive calculation:
-
-```powershell
-gam-app plan --config configs/my_experiment.yaml
-```
-
-Example output:
-
-```text
-       model  candidates  estimated_fits
-    gam_main          60            7500
-gam_pairwise         120           15000
-```
-
-This reports:
-
-- models;
-- hyperparameter candidates;
-- approximate number of model fits.
-
-The user can then choose a smaller preset or adjust the generated configuration through the configuration workflow.
-
----
-
-# 8.1 Experiment Tags and Metadata
-
-Configurations and runs support user-defined tags and key-value metadata under the `experiment` section:
-
-```yaml
-experiment:
-  name: my_experiment
-  primary_metric: log_loss
-  tags:
-    - candidate
-    - grouped
-  metadata:
-    project: bridge-study
-    cohort: 2026-q3
-```
-
-Tags and metadata are validated (tags up to 64 chars, max 32 tags; metadata keys matching `[A-Za-z][A-Za-z0-9_.-]*` and scalar string values up to 256 chars) and persisted in both `config.yaml` and `run.json`.
-
----
-
-# 9. Run the experiment
-
-`gam-app run` options for automation and path discovery:
-- `--json`: Emits a single machine-readable JSON object with schema `gam_run_creation` to `stdout` immediately upon successful run creation, routing subsequent execution logs to `stderr`.
-- `--create-only`: Initializes the run directory, records `run.json` and `status.json` with `state: "created"`, and exits without starting model fitting.
-- `--run-path-file`: Atomically writes the absolute created run path (with a trailing newline) to a file before execution begins.
-
----
-
-# 9.1 Run Discovery and Filtering (`gam-app list-runs`)
-
-List and filter runs in a workspace without parsing full configuration or model files:
-
-```powershell
-gam-app list-runs --workspace workspace
-```
-
-Filters (combined using logical AND):
-- `--state`: Single or repeated state choices (`created`, `running`, `paused`, `completed`, `failed`, `cancelled`, `unknown`) (OR logic across states).
-- `--experiment`: Match experiment name.
-- `--strategy`: Filter by validation strategy (`stratified`, `stratified_group`, `time`).
-- `--duplicate-policy`: Filter by duplicate policy (`report`, `error`, `group`).
-- `--model`: Filter by model ID.
-- `--tag`: Searchable tag filter (case-insensitive, AND logic for repeated tags).
-- `--metadata KEY=VALUE`: Filter by metadata equality.
-- `--created-after / --created-before`: ISO 8601 timestamps or YYYY-MM-DD date boundaries in inclusive UTC.
-- `--limit`: Return top N runs (sorting newest first).
-- `--json`: Machine-readable JSON output schema `gam_run_catalog`.
-
-```powershell
-gam-app run `
-  --config configs/my_experiment.yaml `
-  --workspace workspace
-```
-
-The application creates a unique run directory:
-
-```text
-workspace/runs/run-<timestamp>-<identifier>/
-```
-
-Each run is immutable with respect to its dataset and configuration hashes.
-
----
-
-# 10. Run directory structure
+Each experiment run creates a unique, self-contained directory in the workspace:
 
 ```text
 run-id/
@@ -842,542 +193,110 @@ run-id/
 ├── status.json
 ├── events.jsonl
 ├── run.lock
-├── control/
 ├── checkpoints/
-│   ├── gam_main/
-│   └── gam_pairwise/
+├── diagnostics/
 ├── results/
-│   ├── gam_main/
-│   └── gam_pairwise/
 ├── models/
-│   ├── gam_main/
-│   └── gam_pairwise/
 ├── plots/
 ├── reports/
 └── logs/
 ```
 
-The run stores:
+- `run.json`: overall run metadata including experiment tags and key-value metadata.
+- `status.json`: atomically updated progress state (`created`, `running`, `paused`, `completed`, `failed`, `cancelled`).
+- `events.jsonl`: append-only event log.
+- `split_manifest.csv`: deterministic outer cross-validation fold assignments shared by all models in the run.
+- `diagnostics/`: schema-versioned diagnostic artifacts (`diagnostics_manifest.json`, correlation matrices, duplicate groups, predictor dictionary).
+- `reports/report.html`: standalone HTML report summarizing validation design, diagnostics, nested CV metrics, and confusion matrices.
 
-- exact resolved configuration;
-- dataset hash;
-- configuration hash;
-- Python/platform/package versions;
-- persisted CV split assignments;
-- progress state;
-- event timeline;
-- fold checkpoints;
-- out-of-fold predictions;
-- final models;
-- reports and plots.
+For operational command details and artifact inspection steps, see `docs/powershell-workflow.md`.
 
-No database is required.
+## Diagnostics
 
----
+The application runs dataset and duplicate diagnostics during profiling and experiment execution:
 
-# 11. Monitoring
+- Predictor correlations: Pearson and Spearman matrices with ranked high-correlation pair reporting.
+- Derived variables: detection of declared and suspected functional relationships (affine, log, square, square root).
+- Duplicate analysis: identification of exact duplicate groups and proper near-duplicate groups using transitive closure.
+- Conflicting targets: detection of predictor-identical records with conflicting target labels.
+- Duplicate policies (`report`, `error`, `group`): enforce error stops or merge duplicate constraints into effective validation groups.
 
-Show the current state:
+For in-depth scientific interpretation of diagnostic findings, see `docs/scientific-interpretation.md`.
 
-```powershell
-gam-app status `
-  --run workspace/runs/<run-id>
-```
+## Documentation
 
-Follow progress continuously:
+- `docs/powershell-workflow.md`: Audited operational PowerShell workflow with step-by-step commands, exit-code checking, JSON parsing, run recovery, and command lifecycle examples.
+- `docs/scientific-interpretation.md`: Comprehensive scientific guide covering model mathematical formulation, predictor roles, regularization, nested validation, metrics, diagnostics, comparison sign conventions, review checklist, and reporting template.
 
-```powershell
-gam-app status `
-  --run workspace/runs/<run-id> `
-  --follow
-```
-
-`status.json` contains fields such as:
-
-```json
-{
-  "state": "running",
-  "phase": "nested_cross_validation",
-  "model_id": "gam_pairwise",
-  "repeat": 2,
-  "fold": 4,
-  "completed_outer_folds": 8,
-  "total_outer_folds": 15,
-  "updated_at_utc": "..."
-}
-```
-
-`events.jsonl` provides an append-only event history.
-
----
-
-# 12. Pause and resume
-
-Request a safe pause:
+## Development
 
 ```powershell
-gam-app pause `
-  --run workspace/runs/<run-id>
+poetry run ruff format --check .
+poetry run ruff check .
+poetry run mypy src
+poetry run pytest --cov=gam_app --cov-report=term-missing
 ```
 
-The worker:
+The test suite includes focused unit tests, artifact-contract tests, property-based duplicate-analysis tests, and complete stratified, group-aware, and time-aware workflows.
 
-1. finishes the current safe fold unit;
-2. writes the checkpoint;
-3. transitions the run to `paused`;
-4. exits cleanly.
-
-Resume:
+Run the current suite to obtain the authoritative collected-test and coverage counts:
 
 ```powershell
-gam-app resume `
-  --run workspace/runs/<run-id>
+poetry run pytest --cov=gam_app --cov-report=term-missing
 ```
 
-Completed checkpoints are validated and skipped.
-
----
-
-# 13. Cancel
-
-```powershell
-gam-app cancel `
-  --run workspace/runs/<run-id>
-```
-
-The application stops after the current safe calculation unit and marks the run as cancelled.
-
-A cancelled run remains auditable, and completed checkpoints are retained.
-
----
-
-# 14. Checkpoint design
-
-Each completed outer fold contains:
-
-```text
-checkpoints/
-└── gam_main/
-    └── repeat-01_fold-01/
-        ├── checkpoint.json
-        ├── metrics.json
-        ├── trials.parquet
-        ├── predictions.parquet
-        ├── model.joblib
-        └── COMPLETE
-```
-
-A checkpoint is reusable only if:
-
-- `COMPLETE` exists;
-- its dataset hash matches;
-- its configuration hash matches.
-
-Incomplete temporary checkpoints are not treated as completed work.
-
-JSON state updates use atomic file replacement to avoid partially written status files.
-
----
-
-# 15. Reproducible outer splits
-
-The application generates:
-
-```text
-split_manifest.csv
-```
-
-Example columns:
-
-```text
-repeat
-fold
-row_id
-row_index
-partition
-```
-
-Both main-effects and pairwise models consume the same persisted split manifest.
-
-This protects comparisons from accidental differences caused by:
-
-- row reordering;
-- changed random-state handling;
-- filtering in only one workflow;
-- independently generated folds.
-
----
-
-# 16. Outputs
-
-For every model:
-
-```text
-results/<model-id>/
-├── fold_metrics.csv
-├── predictions.parquet
-├── summary.csv
-└── inspection/
-```
-
-Final model artifacts:
-
-```text
-models/<model-id>/
-├── model.joblib
-├── best_parameters.json
-├── search_trials.parquet
-└── components.csv
-```
-
-The report is generated at:
-
-```text
-reports/report.html
-```
-
-It includes:
-
-- experiment identity;
-- validation design and split-integrity status summary;
-- predictor-diagnostics count summary (review/warning correlations, declared derived features, suspected relations, exact/near duplicate groups, conflicting duplicate target groups);
-- prominent warning if duplicate-target conflicts exist;
-- compact preview of high predictor correlations (limited to top 10 pairs, linking full CSV report);
-- links to complete diagnostic artifacts (`Predictor dictionary`, correlation matrices, duplicate reports, etc.);
-- model summaries;
-- nested-CV metrics;
-- confusion matrices;
-- links to detailed result tables.
-
----
-
-# 17. Inspect fitted equations
-
-```powershell
-gam-app inspect `
-  --run workspace/runs/<run-id> `
-  --model gam_main
-```
-
-For the pairwise model:
-
-```powershell
-gam-app inspect `
-  --run workspace/runs/<run-id> `
-  --model gam_pairwise
-```
-
-Choose a reference class:
-
-```powershell
-gam-app inspect `
-  --run workspace/runs/<run-id> `
-  --model gam_main `
-  --reference-class B
-```
-
-This generates:
-
-```text
-results/<model-id>/inspection/
-├── components.csv
-├── equations.txt
-└── reference_equations.csv
-```
-
-`equations.txt` contains the exact transformed-space score equations.
-
----
-
-# 18. Verify the link function
-
-```powershell
-gam-app verify-link `
-  --run workspace/runs/<run-id> `
-  --model gam_main
-```
-
-The application compares:
-
-```python
-model.predict_proba(X)
-```
-
-with:
-
-```python
-softmax(model.decision_function(X))
-```
-
-Outputs:
-
-```text
-results/<model-id>/link_verification/
-├── scores.csv
-├── probabilities.csv
-└── verification.txt
-```
-
-The maximum error should be near floating-point precision.
-
----
-
-# 19. Compare experiments or models
-
-```powershell
-gam-app compare `
-  --left workspace/runs/<left-run> `
-  --left-model gam_main `
-  --right workspace/runs/<right-run> `
-  --right-model gam_pairwise `
-  --output comparisons/main-vs-pairwise
-```
-
-The application merges fold metrics by:
-
-```text
-repeat
-fold
-```
-
-and calculates:
-
-```text
-log_loss_difference
-accuracy_difference
-balanced_accuracy_difference
-macro_f1_difference
-```
-
-The direction is:
-
-$$
-\Delta=\text{right}-\text{left}.
-$$
-
-Outputs:
-
-```text
-comparisons/main-vs-pairwise/
-├── comparison.csv
-└── summary.csv
-```
-
----
-
-# 20. Batch prediction
-
-```powershell
-gam-app predict `
-  --model workspace/runs/<run-id>/models/gam_main/model.joblib `
-  --input new_observations.csv `
-  --output predictions.csv
-```
-
-Output columns include:
-
-```text
-probability_<class-1>
-probability_<class-2>
-...
-predicted_class
-```
-
-The fitted transformer selects the configured predictors by name, so input column order does not need to match the training file.
-
-Only trusted application-generated `.joblib` files should be loaded.
-
----
-
-# 21. Demonstration workflow
-
-Generate synthetic demonstration data:
-
-```powershell
-gam-app demo `
-  --output examples/demo.csv `
-  --rows 300 `
-  --seed 42
-```
-
-Create a quick configuration:
-
-```powershell
-gam-app configure `
-  --data examples/demo.csv `
-  --target Y `
-  --output examples/generated-demo.yaml `
-  --preset quick `
-  --non-interactive
-```
-
-Preview:
-
-```powershell
-gam-app plan `
-  --config examples/generated-demo.yaml
-```
-
-Run:
-
-```powershell
-gam-app run `
-  --config examples/generated-demo.yaml `
-  --workspace workspace
-```
-
----
-
-# 22. Automated tests
-
-Run the complete test suite:
-
-```powershell
-poetry run pytest
-```
-
-You can also run targeted subsets using registered Pytest markers:
-
-```powershell
-poetry run pytest -m e2e
-poetry run pytest -m property
-poetry run pytest -m "not e2e"
-```
-
-### Comprehensive Test Coverage
-
-- **End-to-End Scientific Workflows (`tests/test_e2e_*.py`)**:
-  Coordinated end-to-end verification that complete runs produce scientifically valid splits and mutually consistent persisted artifacts across all three validation strategies:
-  - `stratified`: Ordinary stratified cross-validation with diagnostic duplicate reporting (`tests/test_e2e_stratified_diagnostics.py`).
-  - `stratified_group`: Transitive effective group creation and inner/outer fold group leakage protection (`tests/test_e2e_group_aware.py`).
-  - `time`: Chronological time-series splitting with gap and test-size enforcement (`tests/test_e2e_time_aware.py`).
-- **Property-Based Near-Duplicate Invariants (`tests/test_near_duplicate_properties.py`)**:
-  Hypothesis property tests covering symmetry, reflexivity, boundedness, threshold monotonicity, target invariance, row permutation invariance, connected component transitivity, and string/signed-zero canonicalization.
-- **Diagnostic Artifact Schema Contracts (`tests/test_diagnostic_artifact_schemas.py`)**:
-  Centralized contract tests checking exact column ordering, empty/populated state compatibility, controlled vocabularies, identifier uniqueness, semantic column relationships, strict JSON parsing, and disk manifest byte/hash/row inventory verification.
-- **Invalid Configuration Matrix (`tests/test_invalid_configuration_matrix.py`)**:
-  Comprehensive parameterized matrix validating configuration rules, reserved role conflicts, predictor overlap, strategy constraints, duplicate policies, tags/metadata rules, and actionable error messages.
-- **Focused Unit Coverage**:
-  Transformation dimensions, stable feature names, tensor-product features, serialization round trips, link function probabilities, CLI subcommands, split integrity checks, run catalog filtering, and model checkpointing.
-
----
-
-# 23. Quality checks
-
-```powershell
-ruff format --check .
-ruff check .
-mypy src
-pytest --cov=gam_app --cov-report=term-missing
-```
-
-The source package also passed:
-
-```powershell
-python -m compileall src tests
-```
-
----
-
-## Diagnostics Output Contract
-
-The app produces standardized, machine-verifiable diagnostics artifacts and a schema-versioned manifest (`diagnostics_manifest.json`, version `1.0`):
-
-### Canonical Artifact Inventory
-- `correlation_pearson.csv` (`correlation_matrix/1.0`): Pearson correlation matrix.
-- `correlation_spearman.csv` (`correlation_matrix/1.0`): Spearman correlation matrix.
-- `high_correlation_pairs.csv` (`high_correlation_pairs/1.0`): Ranked high-correlation predictor pairs.
-- `numeric_predictor_dictionary.csv` (`predictor_dictionary/1.0`): Predictor data dictionary.
-  > *For backward compatibility, the predictor dictionary is stored as `numeric_predictor_dictionary.csv`. Despite the historical filename, the artifact may include both numeric and nonnumeric predictors. Use the `numeric` column to distinguish them.*
-- `suspected_derived_relations.csv` (`suspected_derived_relations/1.0`): Suspected exact, affine, log, square, and square root functional relations.
-- `exact_duplicate_groups.csv` (`exact_duplicate_groups/1.0`): Exact predictor duplicate groups.
-- `near_duplicate_groups.csv` (`near_duplicate_groups/1.0`): Proper near-duplicate predictor groups.
-- `conflicting_duplicate_targets.csv` (`conflicting_duplicate_targets/1.0`): Exact duplicate predictor groups with conflicting target labels.
-
-### High-Correlation Pair Ordering & Dominant Correlation
-- **Ordering**: Pairs exceeding `review_threshold` are sorted deterministically by:
-  1. Severity (`warning` before `review`)
-  2. Maximum absolute correlation (descending)
-  3. Complete-pair count (descending)
-  4. Left predictor name (ascending)
-  5. Right predictor name (ascending)
-- **Dominant method & tie rules**: Each pair identifies `dominant_method` (`pearson`, `spearman`, `tie`, `none`). When Pearson and Spearman magnitudes match within $10^{-12}$, `dominant_method` is `"tie"` and `dominant_correlation` is `null` (empty in CSV).
-- **Trigger methods**: Format uses fixed method order (`pearson|spearman`).
-- **Coverage**: Includes `complete_pair_count`, `row_count`, and `complete_pair_fraction`.
-
-### Validation Design & Predictor Diagnostics Reporting (GAM-109 – GAM-112)
-- **Validation Design Summary**:
-  - Displays strategy (`stratified`, `stratified_group`, `time`), configured group column, time column, duplicate policy, fold settings, random state, temporal gap, temporal test size, and split-integrity status.
-  - Unconfigured group or time columns display as `Not configured`.
-  - Non-time strategy temporal settings display as `Not applicable`.
-  - Missing metadata displays as `Not available`.
-- **Predictor Diagnostics Count Summary**:
-  - Summarizes review-level correlation pairs (`severity == "review"`), warning-level correlation pairs (`severity == "warning"`), declared derived predictors, suspected derived relations, exact duplicate groups, proper near-duplicate groups, and conflicting duplicate target groups.
-  - Review and warning correlation counts are mutually exclusive (their sum equals total high-correlation pairs).
-  - Analysis status is distinguished: `completed` displays numerical counts, `disabled` displays `Not evaluated`, `failed` displays `Unavailable`, and `not_applicable` displays `Not applicable`.
-- **Compact Correlation Preview**:
-  - Inline preview table displays at most the top 10 high-correlation pairs using canonical ordering.
-  - Formats coverage as percentage (`.1%`) and correlation values to four decimal places (`.4f`).
-  - Displays truncation status (e.g. `Showing 10 of 25 high-correlation pairs.`) and links to `high_correlation_pairs.csv`.
-- **Prominent Duplicate-Target Conflict Warning**:
-  - Prominently displays an alert banner when `conflicting_duplicate_target_group_count > 0`.
-  - Wording explains that predictor-identical records have different target labels and cannot be distinguished deterministically from available predictors alone.
-  - Does not call dataset invalid, or recommend record deletion or relabeling.
-- **Diagnostic Artifact Links**:
-  - Links to diagnostic artifacts (labeled `Predictor dictionary` for the predictor dictionary artifact) only when the artifact entry status is `written` and the file exists.
-
-### Data Dictionary & Derivation Status Vocabularies
-- **`metadata_status`**: `provided` vs `not_provided`.
-- **`derived_status`**: `declared`, `not_declared`, `suspected`, `not_evaluated`.
-- **Derivation distinction**: Standalone execution without a supplied data dictionary produces `metadata_status = not_provided` and `derived_status = not_evaluated`. Absence of metadata is recorded as `not_evaluated`, not as a negative finding (`not_declared`).
-
----
-
-## Duplicate Analysis and Validation Policies
-
-The app provides formal duplicate analysis and policy enforcement (GAM-103 & GAM-104):
-
-### Exact vs Near Duplicate Definitions
-- **Exact duplicate group**: Rows with identical canonical raw predictor values.
-- **Proper near-duplicate group**: Rows satisfying the pairwise match threshold `match_fraction >= near_duplicate_threshold` (after canonicalization and numeric rounding to `rounding_decimals`), containing at least two distinct exact predictor signatures.
-- **Transitive Closure**: Pairwise near-duplicate similarity is transitively closed via connected components (Union-Find) for cross-validation group safety.
-
-### Duplicate Group Policies (`validation.duplicate_group_policy`)
-- `report` (default): Writes duplicate diagnostics reports without altering cross-validation partitioning.
-- `error`: Fails before split manifest creation with `DataValidationError` if exact or proper near-duplicate groups exist.
-- `group`: Merges configured `data.group` labels, exact duplicate signatures, and near-duplicate edges transitively using Union-Find to create effective validation groups, preventing group leakage across CV folds in both inner and outer CV.
-
----
-
-# 24. Current release boundaries
-
-This reference release is intentionally scoped to:
-
-- standalone local execution;
-- CLI operation;
-- file-based persistence;
-- CSV, TSV, and Parquet;
-- categorical classification targets;
-- numeric and categorical predictors;
-- smooth, linear, categorical, and excluded feature roles;
-- repeated nested stratified CV;
-- main-effects GAMs;
-- explicit or all-eligible smooth–smooth interactions;
-- batch prediction;
-- reproducible HTML and machine-readable outputs.
-
-Not yet included:
-
-- desktop graphical wizard;
-- grouped or temporal CV;
-- stability-aware forward interaction selection;
-- smooth main-effect plots and interaction surface plots;
-- categorical–smooth interactions;
-- functional-ANOVA interaction centering;
-- calibration plots and local explanation dashboards;
-- distributed execution;
-- executable desktop installer.
-
-The architecture keeps these additions separate from the modelling core, so they can be implemented without returning to dataset-specific scripts.
-
----
+## Security
+
+Only load `.joblib` models created by a trusted installation. Joblib is pickle-based. The application records package versions and model metadata, but a serialized Python object is not a safe interchange format for untrusted files.
+
+# Current release boundaries
+
+## Included
+
+This release supports:
+
+- local standalone execution
+- command-line operation
+- file-based persistence without a database
+- CSV, TSV, and Parquet input
+- categorical binary and multiclass classification targets
+- numeric and categorical predictors
+- smooth, linear, categorical, and excluded feature roles
+- main-effects additive models
+- explicit and all-eligible smooth-by-smooth tensor-product interactions
+- ordinary stratified nested validation
+- stratified group-aware nested validation
+- forward time-aware nested validation
+- configured and duplicate-derived validation groups
+- exact and proper near-duplicate diagnostics
+- predictor-correlation diagnostics
+- persisted validation and diagnostic manifests
+- pause, resume, cancel, and fold-level checkpoint recovery
+- final model fitting and batch prediction
+- transformed-space inspection and contribution exports
+- paired run or model comparison
+- HTML and machine-readable outputs
+- local run discovery and metadata filtering
+
+## Not included
+
+This release does not include:
+
+- regression, survival, count, or continuous-target modelling
+- causal-effect estimation
+- classical unpenalized coefficient significance tests
+- confidence intervals or p-values for smooth terms
+- automated feature selection based on causal or scientific relevance
+- stability-aware forward interaction selection
+- categorical-by-smooth interaction terms
+- functional-ANOVA centering of interaction surfaces
+- automated calibration curves or recalibration
+- local explanation dashboards
+- a desktop graphical application
+- a hosted web service
+- distributed or cluster execution
+- a database-backed run registry
+- remote artifact storage
+- automated correction of conflicting target labels
+- automatic deletion or relabelling of duplicate observations
+- an executable desktop installer
