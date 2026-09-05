@@ -35,7 +35,15 @@ from .io_utils import (
 )
 from .reporting import create_reports
 from .run_store import FileRunStore
-from .splitting import SplitContext, create_split_manifest, merge_group_constraints
+from .splitting import (
+    ALL_INTEGRITY_CHECKS,
+    SplitContext,
+    create_split_manifest,
+    evaluate_split_integrity,
+    merge_group_constraints,
+    raise_for_split_integrity,
+    split_integrity_frame,
+)
 
 
 def create_run(config_path: Path, workspace: Path) -> Path:
@@ -164,8 +172,9 @@ def execute_run(run_directory: Path) -> None:
             else 0
         )
 
+        diagnostics_manifest_path = diagnostics_directory / "diagnostics_manifest.json"
         write_json_atomic(
-            diagnostics_directory / "diagnostics_manifest.json",
+            diagnostics_manifest_path,
             {
                 "correlation": {
                     "enabled": config.profiling.correlation.enabled,
@@ -191,6 +200,10 @@ def execute_run(run_directory: Path) -> None:
                 },
                 "validation": {
                     "strategy": config.validation.strategy,
+                    "outer_splits": config.validation.outer_splits,
+                    "outer_repeats": config.validation.outer_repeats,
+                    "inner_splits": config.validation.inner_splits,
+                    "duplicate_group_policy": config.validation.duplicate_group_policy,
                     "split_integrity_passed": True,
                 },
             },
@@ -253,10 +266,83 @@ def execute_run(run_directory: Path) -> None:
 
         split_path = run_directory / "split_manifest.csv"
         if split_path.exists():
-            splits = pd.read_csv(split_path)
+            splits = pd.read_csv(
+                split_path,
+                dtype={
+                    "row_id": "string",
+                    "group_id": "string",
+                },
+            )
+            splits["row_id"] = splits["row_id"].astype(str)
+            if "group_id" in splits.columns:
+                splits["group_id"] = splits["group_id"].astype("string")
         else:
             splits = create_split_manifest(config, context)
-            splits.to_csv(split_path, index=False)
+            splits.to_csv(
+                split_path,
+                index=False,
+                encoding="utf-8",
+            )
+
+        store.update_status(
+            state="running",
+            phase="split_integrity",
+        )
+
+        integrity_results = evaluate_split_integrity(
+            config,
+            context,
+            splits,
+        )
+
+        integrity_frame = split_integrity_frame(integrity_results)
+        integrity_path = diagnostics_directory / "split_integrity.csv"
+        integrity_frame.to_csv(
+            integrity_path,
+            index=False,
+            encoding="utf-8",
+        )
+
+        integrity_passed = (
+            bool(integrity_frame["passed"].all())
+            if not integrity_frame.empty
+            else False
+        )
+        failed_result_count = (
+            int((~integrity_frame["passed"]).sum()) if not integrity_frame.empty else 0
+        )
+        evaluated_checks = (
+            sorted(set(integrity_frame["check"])) if not integrity_frame.empty else []
+        )
+        not_applicable_checks = sorted(
+            set(ALL_INTEGRITY_CHECKS) - set(evaluated_checks)
+        )
+
+        diagnostics_manifest = json.loads(
+            diagnostics_manifest_path.read_text(encoding="utf-8")
+        )
+        diagnostics_manifest["split_integrity"] = {
+            "artifact": str(integrity_path.relative_to(run_directory)),
+            "result_count": int(len(integrity_frame)),
+            "distinct_check_count": int(len(evaluated_checks)),
+            "failed_result_count": failed_result_count,
+            "passed": integrity_passed,
+            "evaluated_checks": evaluated_checks,
+            "not_applicable_checks": not_applicable_checks,
+        }
+        diagnostics_manifest["validation"]["split_integrity_passed"] = integrity_passed
+        write_json_atomic(diagnostics_manifest_path, diagnostics_manifest)
+
+        store.event(
+            "split_integrity_evaluated",
+            strategy=config.validation.strategy,
+            passed=integrity_passed,
+            result_count=int(len(integrity_frame)),
+            failed_result_count=failed_result_count,
+            artifact=str(integrity_path.relative_to(run_directory)),
+        )
+
+        raise_for_split_integrity(integrity_results)
 
         store.update_status(
             state="running", phase="evaluation", started_at_utc=utc_now()
