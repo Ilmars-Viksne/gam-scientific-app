@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -104,20 +105,31 @@ class DisjointSet:
 def merge_group_constraints(
     *,
     row_count: int,
-    configured_groups: pd.Series | None,
-    duplicate_signatures: pd.Series | None,
-) -> pd.Series | None:
-    if configured_groups is None and duplicate_signatures is None:
-        return None
-
+    configured_groups: pd.Series | None = None,
+    duplicate_signatures: pd.Series | None = None,
+    label_constraints: Sequence[pd.Series | None] = (),
+    edge_constraints: Sequence[pd.DataFrame | None] = (),
+    row_ids: pd.Series | None = None,
+) -> pd.Series:
     union = DisjointSet(row_count)
 
-    for labels in (configured_groups, duplicate_signatures):
-        if labels is None:
-            continue
+    # Convert row_id string lookup if edge_constraints are provided
+    row_id_to_idx: dict[str, int] = {}
+    if row_ids is not None:
+        for idx, rid in enumerate(row_ids.astype(str)):
+            row_id_to_idx[rid] = idx
 
+    all_labels: list[pd.Series] = []
+    if configured_groups is not None:
+        all_labels.append(configured_groups)
+    if duplicate_signatures is not None:
+        all_labels.append(duplicate_signatures)
+    for lbl in label_constraints:
+        if lbl is not None:
+            all_labels.append(lbl)
+
+    for labels in all_labels:
         first_index_by_label: dict[str, int] = {}
-
         for row_index, value in enumerate(labels.astype(str)):
             if value in first_index_by_label:
                 union.union(
@@ -126,6 +138,15 @@ def merge_group_constraints(
                 )
             else:
                 first_index_by_label[value] = row_index
+
+    for edge_df in edge_constraints:
+        if edge_df is None or edge_df.empty:
+            continue
+        for row in edge_df.itertuples(index=False):
+            left_id = str(row.left_row_id)
+            right_id = str(row.right_row_id)
+            if left_id in row_id_to_idx and right_id in row_id_to_idx:
+                union.union(row_id_to_idx[left_id], row_id_to_idx[right_id])
 
     roots = [union.find(index) for index in range(row_count)]
     sorted_unique_roots = sorted(set(roots))

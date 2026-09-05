@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -54,6 +55,7 @@ class DuplicateGroupConfig:
     rounding_decimals: int = 8
     near_duplicate_threshold: float = 0.98
     include_target_in_signature: bool = False
+    maximum_pairwise_rows: int = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,9 +182,29 @@ class ExperimentConfig:
             raise ConfigurationError("minimum_complete_pairs must be at least 2.")
 
         # Duplicate groups validation
-        if not 0.0 <= self.profiling.duplicate_groups.near_duplicate_threshold <= 1.0:
+        if self.profiling.duplicate_groups.rounding_decimals < 0:
             raise ConfigurationError(
-                "near_duplicate_threshold must be between 0 and 1."
+                "profiling.duplicate_groups.rounding_decimals cannot be negative."
+            )
+
+        threshold = self.profiling.duplicate_groups.near_duplicate_threshold
+        if not math.isfinite(threshold) or not (0.0 < threshold <= 1.0):
+            raise ConfigurationError(
+                "profiling.duplicate_groups.near_duplicate_threshold "
+                "must satisfy 0.0 < threshold <= 1.0."
+            )
+
+        if self.profiling.duplicate_groups.maximum_pairwise_rows < 2:
+            raise ConfigurationError(
+                "profiling.duplicate_groups.maximum_pairwise_rows must be at least 2."
+            )
+
+        if self.profiling.duplicate_groups.include_target_in_signature:
+            raise ConfigurationError(
+                "profiling.duplicate_groups.include_target_in_signature=true "
+                "is not supported. Duplicate identities used for validation "
+                "must be constructed from predictors only. Target values "
+                "are used only to detect conflicting duplicate targets."
             )
 
         # Validation strategy and policy checks
@@ -190,28 +212,34 @@ class ExperimentConfig:
             raise ConfigurationError("validation.gap cannot be negative.")
 
         if (
+            self.validation.duplicate_group_policy in {"group", "error"}
+            and not self.profiling.duplicate_groups.enabled
+        ):
+            raise ConfigurationError(
+                "validation.duplicate_group_policy requires "
+                "profiling.duplicate_groups.enabled=true."
+            )
+
+        if (
             self.validation.duplicate_group_policy == "group"
-            and self.validation.strategy == "stratified"
+            and self.validation.strategy != "stratified_group"
         ):
             raise ConfigurationError(
                 "validation.duplicate_group_policy='group' requires "
                 "validation.strategy='stratified_group'."
             )
 
-        if (
-            self.validation.duplicate_group_policy == "group"
-            and not self.profiling.duplicate_groups.enabled
-        ):
-            raise ConfigurationError(
-                "validation.duplicate_group_policy='group' requires "
-                "profiling.duplicate_groups.enabled=true."
-            )
-
         if self.validation.strategy == "stratified_group":
-            if self.group_column is None:
+            configured_grouping = self.group_column is not None
+            duplicate_grouping = (
+                self.validation.duplicate_group_policy == "group"
+                and self.profiling.duplicate_groups.enabled
+            )
+            if not configured_grouping and not duplicate_grouping:
                 raise ConfigurationError(
-                    "data.group is required when validation.strategy "
-                    "is 'stratified_group'."
+                    "validation.strategy='stratified_group' requires either "
+                    "data.group or validation.duplicate_group_policy='group' "
+                    "with profiling.duplicate_groups.enabled=true."
                 )
 
         if self.validation.strategy == "time":

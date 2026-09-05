@@ -1037,6 +1037,22 @@ python -m compileall src tests
 
 ---
 
+## Duplicate Analysis and Validation Policies
+
+The app provides formal duplicate analysis and policy enforcement (GAM-103 & GAM-104):
+
+### Exact vs Near Duplicate Definitions
+- **Exact duplicate group**: Rows with identical canonical raw predictor values.
+- **Proper near-duplicate group**: Rows satisfying the pairwise match threshold `match_fraction >= near_duplicate_threshold` (after canonicalization and numeric rounding to `rounding_decimals`), containing at least two distinct exact predictor signatures.
+- **Transitive Closure**: Pairwise near-duplicate similarity is transitively closed via connected components (Union-Find) for cross-validation group safety.
+
+### Duplicate Group Policies (`validation.duplicate_group_policy`)
+- `report` (default): Writes duplicate diagnostics reports without altering cross-validation partitioning.
+- `error`: Fails before split manifest creation with `DataValidationError` if exact or proper near-duplicate groups exist.
+- `group`: Merges configured `data.group` labels, exact duplicate signatures, and near-duplicate edges transitively using Union-Find to create effective validation groups, preventing group leakage across CV folds in both inner and outer CV.
+
+---
+
 # 24. Current release boundaries
 
 This reference release is intentionally scoped to:

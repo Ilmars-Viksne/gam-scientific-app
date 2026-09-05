@@ -70,6 +70,8 @@ def command_profile(args) -> None:
         correlation_warning_threshold=float(args.warn_correlation),
         minimum_complete_pairs=3,
         near_duplicate_decimals=int(args.near_duplicate_decimals),
+        near_duplicate_threshold=float(getattr(args, "near_duplicate_threshold", 0.98)),
+        maximum_pairwise_rows=int(getattr(args, "maximum_pairwise_rows", 10_000)),
     )
 
     diagnostics = calculate_standalone_diagnostics(
@@ -2295,6 +2297,8 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--review-correlation", type=float, default=0.75)
     profile.add_argument("--warn-correlation", type=float, default=0.90)
     profile.add_argument("--near-duplicate-decimals", type=int, default=8)
+    profile.add_argument("--near-duplicate-threshold", type=float, default=0.98)
+    profile.add_argument("--maximum-pairwise-rows", type=int, default=10_000)
     profile.set_defaults(func=command_profile)
     configure = sub.add_parser("configure")
     configure.add_argument("--data", type=Path, required=True)
