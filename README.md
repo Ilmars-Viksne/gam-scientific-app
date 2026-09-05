@@ -60,6 +60,18 @@ Validate and estimate the work:
 gam-app plan --config configs/demo.yaml
 ```
 
+Check feasibility in machine-readable JSON format:
+
+```powershell
+gam-app plan --config configs/demo.yaml --json
+```
+
+Migrate a legacy configuration (e.g., schema 1.0 to 1.1):
+
+```powershell
+gam-app migrate-config --input configs/legacy.yaml --output configs/current.yaml
+```
+
 Run:
 
 ```powershell
@@ -335,10 +347,163 @@ thorough
 
 The generated YAML file is the complete experiment contract.
 
-Example:
+Example (Schema 1.1):
 
 ```yaml
-schema_version: "1.0"
+schema_version: "1.1"
+
+experiment:
+  name: my_experiment
+  primary_metric: log_loss
+
+data:
+  path: C:/data/my_dataset.csv
+  target: outcome
+  row_id: id
+  group: batch_id
+  time: null
+
+features:
+  id:
+    role: exclude
+  batch_id:
+    role: exclude
+  temperature:
+    role: smooth
+    missing: error
+  pressure:
+    role: smooth
+    missing: median
+
+models:
+  - id: gam_main
+    interactions: none
+
+validation:
+  strategy: stratified_group
+  outer_splits: 5
+  outer_repeats: 3
+  inner_splits: 5
+  random_state: 42
+  gap: 0
+  test_size: null
+  duplicate_group_policy: group
+
+profiling:
+  correlation:
+    enabled: true
+    pearson: true
+    spearman: true
+    review_threshold: 0.75
+    warning_threshold: 0.90
+    minimum_complete_pairs: 3
+  duplicate_groups:
+    enabled: true
+    rounding_decimals: 8
+    near_duplicate_threshold: 0.98
+    maximum_pairwise_rows: 10000
+    include_target_in_signature: false
+
+search:
+  n_knots: [3, 4, 5]
+  degree: [2, 3]
+  C: [0.01, 0.1, 1.0, 10.0]
+  interaction_scale: [0.5, 1.0]
+
+execution:
+  workers: 1
+  checkpoint_unit: outer_fold
+  stop_on_convergence_warning: true
+```
+
+### Advanced `configure` Options
+
+`gam-app configure` accepts arguments to explicitly set validation design and profiling rules:
+
+```powershell
+gam-app configure `
+  --data data/observations.csv `
+  --target outcome `
+  --output configs/grouped.yaml `
+  --group batch_id `
+  --validation-strategy stratified_group `
+  --duplicate-group-policy group `
+  --outer-splits 5 `
+  --outer-repeats 3 `
+  --inner-splits 5 `
+  --near-duplicate-decimals 8 `
+  --near-duplicate-threshold 0.98 `
+  --maximum-pairwise-rows 10000 `
+  --non-interactive
+```
+
+For time-aware validation:
+
+```powershell
+gam-app configure `
+  --data data/events.csv `
+  --target outcome `
+  --output configs/temporal.yaml `
+  --time observed_at `
+  --validation-strategy time `
+  --outer-splits 5 `
+  --outer-repeats 1 `
+  --gap 10 `
+  --test-size 20 `
+  --non-interactive
+```
+
+Key arguments:
+- Validation design: `--outer-splits`, `--outer-repeats`, `--inner-splits`, `--random-state`, `--test-size`, `--duplicate-group-policy` (`report`, `error`, `group`), `--validation-strategy` (`stratified`, `stratified_group`, `time`), `--gap`.
+- Profiling controls: `--review-correlation`, `--warn-correlation`, `--minimum-complete-pairs`, `--near-duplicate-decimals`, `--near-duplicate-threshold`, `--maximum-pairwise-rows`.
+- Toggles: `--duplicate-groups` / `--no-duplicate-groups`, `--correlation-diagnostics` / `--no-correlation-diagnostics`.
+
+### Reserved Data-Role Columns
+
+Columns configured under `data` (`target`, `row_id`, `group`, `time`) are reserved data roles.
+- Reserved role columns must be distinct (e.g. the same column cannot serve as both `row_id` and `group`).
+- Reserved role columns cannot be active model predictors. In `features`, their role must be set to `exclude` or they must be omitted.
+
+### Schema Migration (`gam-app migrate-config`)
+
+The current configuration schema version is `1.1`. Legacy schema version `1.0` files remain supported for compatibility.
+To upgrade a schema version 1.0 configuration file:
+
+```powershell
+gam-app migrate-config `
+  --input configs/legacy.yaml `
+  --output configs/current.yaml
+```
+
+Migration adds behavior-preserving defaults (such as `validation.strategy: stratified`, `validation.gap: 0`, and profiling blocks) and rebases relative dataset paths relative to the output directory. It validates the configuration structure before writing and will not overwrite files without `--overwrite`.
+
+---
+
+# 8. Data-Dependent Feasibility Checks (`gam-app plan`)
+
+`gam-app plan` verifies whether the configured validation design is feasible for the target dataset before fits are estimated:
+
+```powershell
+gam-app plan --config configs/my_experiment.yaml
+```
+
+Or for machine-readable JSON output:
+
+```powershell
+gam-app plan --config configs/my_experiment.yaml --json
+```
+
+Feasibility checks evaluate:
+- Required columns exist in the dataset.
+- Target column has no missing values and contains at least 2 classes.
+- Stratified class support across outer and inner splits.
+- Effective group counts and class-group support (including duplicate-derived groups if policy is `group`).
+- Temporal window feasibility and timestamps parseability.
+- Near-duplicate scanning row limits.
+
+Exit behavior:
+- Exit code `0`: Plan is feasible. Fit estimation table is printed.
+- Exit code `2`: Validation design is not feasible for the dataset. All evaluated pass/fail/warning checks and an actionable failure summary are displayed, and fit estimates are omitted.
 
 experiment:
   name: my_experiment
