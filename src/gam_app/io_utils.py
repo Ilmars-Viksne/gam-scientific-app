@@ -6,7 +6,9 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import pandas as pd
 import yaml
 
 
@@ -78,3 +80,33 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, default=str) + "\n")
         stream.flush()
+
+
+def write_csv_atomic(
+    frame: pd.DataFrame,
+    path: Path,
+    *,
+    index: bool = False,
+    encoding: str = "utf-8",
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+
+    try:
+        frame.to_csv(
+            temporary_path,
+            index=index,
+            encoding=encoding,
+        )
+        os.replace(
+            temporary_path,
+            path,
+        )
+    finally:
+        temporary_path.unlink(
+            missing_ok=True,
+        )

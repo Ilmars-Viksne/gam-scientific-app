@@ -4,6 +4,7 @@ import json
 import platform
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
@@ -30,6 +31,7 @@ from .io_utils import (
     sha256_file,
     stable_hash,
     utc_now,
+    write_csv_atomic,
     write_json_atomic,
     write_yaml_atomic,
 )
@@ -38,12 +40,91 @@ from .run_store import FileRunStore
 from .splitting import (
     ALL_INTEGRITY_CHECKS,
     SplitContext,
+    SplitIntegrityResult,
     create_split_manifest,
     evaluate_split_integrity,
     merge_group_constraints,
     raise_for_split_integrity,
     split_integrity_frame,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedIntegritySummary:
+    artifact: str
+    passed: bool
+    result_count: int
+    distinct_check_count: int
+    failed_result_count: int
+
+
+def _persist_split_integrity(
+    *,
+    run_directory: Path,
+    diagnostics_manifest_path: Path,
+    results: list[SplitIntegrityResult],
+    store: FileRunStore,
+    strategy: str,
+) -> PersistedIntegritySummary:
+    integrity_path = run_directory / "diagnostics" / "split_integrity.csv"
+    integrity_frame = split_integrity_frame(results)
+
+    write_csv_atomic(
+        integrity_frame,
+        integrity_path,
+        index=False,
+        encoding="utf-8",
+    )
+
+    failed_results = [result for result in results if not result.passed]
+    failed_result_count = len(failed_results)
+    integrity_passed = failed_result_count == 0
+
+    evaluated_checks = sorted({result.check for result in results})
+    distinct_check_count = len(evaluated_checks)
+
+    not_applicable_checks = sorted(set(ALL_INTEGRITY_CHECKS) - set(evaluated_checks))
+
+    result_count = len(results)
+    artifact_relative = "diagnostics/split_integrity.csv"
+
+    diagnostics_manifest = json.loads(
+        diagnostics_manifest_path.read_text(encoding="utf-8")
+    )
+
+    diagnostics_manifest["split_integrity"] = {
+        "artifact": artifact_relative,
+        "result_count": result_count,
+        "distinct_check_count": distinct_check_count,
+        "failed_result_count": failed_result_count,
+        "passed": integrity_passed,
+        "evaluated_checks": evaluated_checks,
+        "not_applicable_checks": not_applicable_checks,
+    }
+
+    validation = diagnostics_manifest.setdefault("validation", {})
+    validation["strategy"] = strategy
+    validation["split_integrity_passed"] = integrity_passed
+
+    write_json_atomic(diagnostics_manifest_path, diagnostics_manifest)
+
+    store.event(
+        "split_integrity_evaluated",
+        strategy=strategy,
+        passed=integrity_passed,
+        result_count=result_count,
+        distinct_check_count=distinct_check_count,
+        failed_result_count=failed_result_count,
+        artifact=artifact_relative,
+    )
+
+    return PersistedIntegritySummary(
+        artifact=artifact_relative,
+        passed=integrity_passed,
+        result_count=result_count,
+        distinct_check_count=distinct_check_count,
+        failed_result_count=failed_result_count,
+    )
 
 
 def create_run(config_path: Path, workspace: Path) -> Path:
@@ -295,51 +376,12 @@ def execute_run(run_directory: Path) -> None:
             splits,
         )
 
-        integrity_frame = split_integrity_frame(integrity_results)
-        integrity_path = diagnostics_directory / "split_integrity.csv"
-        integrity_frame.to_csv(
-            integrity_path,
-            index=False,
-            encoding="utf-8",
-        )
-
-        integrity_passed = (
-            bool(integrity_frame["passed"].all())
-            if not integrity_frame.empty
-            else False
-        )
-        failed_result_count = (
-            int((~integrity_frame["passed"]).sum()) if not integrity_frame.empty else 0
-        )
-        evaluated_checks = (
-            sorted(set(integrity_frame["check"])) if not integrity_frame.empty else []
-        )
-        not_applicable_checks = sorted(
-            set(ALL_INTEGRITY_CHECKS) - set(evaluated_checks)
-        )
-
-        diagnostics_manifest = json.loads(
-            diagnostics_manifest_path.read_text(encoding="utf-8")
-        )
-        diagnostics_manifest["split_integrity"] = {
-            "artifact": str(integrity_path.relative_to(run_directory)),
-            "result_count": int(len(integrity_frame)),
-            "distinct_check_count": int(len(evaluated_checks)),
-            "failed_result_count": failed_result_count,
-            "passed": integrity_passed,
-            "evaluated_checks": evaluated_checks,
-            "not_applicable_checks": not_applicable_checks,
-        }
-        diagnostics_manifest["validation"]["split_integrity_passed"] = integrity_passed
-        write_json_atomic(diagnostics_manifest_path, diagnostics_manifest)
-
-        store.event(
-            "split_integrity_evaluated",
+        _persist_split_integrity(
+            run_directory=run_directory,
+            diagnostics_manifest_path=diagnostics_manifest_path,
+            results=integrity_results,
+            store=store,
             strategy=config.validation.strategy,
-            passed=integrity_passed,
-            result_count=int(len(integrity_frame)),
-            failed_result_count=failed_result_count,
-            artifact=str(integrity_path.relative_to(run_directory)),
         )
 
         raise_for_split_integrity(integrity_results)
