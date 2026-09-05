@@ -15,12 +15,17 @@ import sklearn
 from . import __version__
 from .config import dump_config_dict, load_config
 from .data import validate_training_data
+from .diagnostic_schema import (
+    DiagnosticArtifacts,
+    build_artifact_manifest_entry,
+    update_diagnostics_manifest,
+)
 from .diagnostics import (
     DuplicateAnalysis,
     analyze_duplicate_groups,
     build_suspected_derived_relations,
     calculate_correlation_analysis,
-    save_correlation_analysis,
+    write_diagnostics,
 )
 from .evaluation import fit_final_model, run_model
 from .exceptions import DataValidationError
@@ -124,7 +129,6 @@ def apply_duplicate_group_policy(
         )
 
     if policy == "group":
-        # Union find merging of configured_groups, exact duplicates, and near edges
         exact_sig_series = duplicate_analysis.exact_signatures
         near_edges = duplicate_analysis.near_edges
 
@@ -138,7 +142,6 @@ def apply_duplicate_group_policy(
 
         effective_group_count = int(effective.nunique())
 
-        # Grouped rows count: rows in groups with size > 1
         group_sizes = effective.value_counts()
         large_groups = set(group_sizes[group_sizes > 1].index)
         grouped_row_count = int(effective.isin(large_groups).sum())
@@ -195,11 +198,8 @@ def _persist_split_integrity(
     result_count = len(results)
     artifact_relative = "diagnostics/split_integrity.csv"
 
-    diagnostics_manifest = json.loads(
-        diagnostics_manifest_path.read_text(encoding="utf-8")
-    )
-
-    diagnostics_manifest["split_integrity"] = {
+    split_integrity_payload = {
+        "status": "completed",
         "artifact": artifact_relative,
         "result_count": result_count,
         "distinct_check_count": distinct_check_count,
@@ -209,11 +209,24 @@ def _persist_split_integrity(
         "not_applicable_checks": not_applicable_checks,
     }
 
-    validation = diagnostics_manifest.setdefault("validation", {})
-    validation["strategy"] = strategy
-    validation["split_integrity_passed"] = integrity_passed
-
-    write_json_atomic(diagnostics_manifest_path, diagnostics_manifest)
+    update_diagnostics_manifest(
+        diagnostics_manifest_path,
+        split_integrity_updates=split_integrity_payload,
+        validation_updates={
+            "strategy": strategy,
+            "split_integrity_passed": integrity_passed,
+        },
+        artifact_entries=[
+            build_artifact_manifest_entry(
+                artifact_id="split_integrity",
+                relative_path="split_integrity.csv",
+                media_type="text/csv",
+                schema_id="split_integrity/1.0",
+                file_path=integrity_path,
+                row_count=len(integrity_frame),
+            )
+        ],
+    )
 
     store.event(
         "split_integrity_evaluated",
@@ -222,11 +235,11 @@ def _persist_split_integrity(
         result_count=result_count,
         distinct_check_count=distinct_check_count,
         failed_result_count=failed_result_count,
-        artifact=artifact_relative,
+        artifact="diagnostics/split_integrity.csv",
     )
 
     return PersistedIntegritySummary(
-        artifact=artifact_relative,
+        artifact="diagnostics/split_integrity.csv",
         passed=integrity_passed,
         result_count=result_count,
         distinct_check_count=distinct_check_count,
@@ -291,14 +304,8 @@ def execute_run(run_directory: Path) -> None:
         diagnostics_directory = run_directory / "diagnostics"
         diagnostics_directory.mkdir(parents=True, exist_ok=True)
 
-        # Correlation Diagnostics
-        high_corr_count = 0
-        if config.profiling.correlation.enabled:
-            corr_analysis = calculate_correlation_analysis(source_frame, config)
-            save_correlation_analysis(corr_analysis, diagnostics_directory)
-            high_corr_count = len(corr_analysis.high_pairs)
+        corr_analysis = calculate_correlation_analysis(source_frame, config)
 
-        # Duplicate Diagnostics via unified analyze_duplicate_groups
         duplicate_analysis = analyze_duplicate_groups(
             X=X,
             y=y,
@@ -306,116 +313,46 @@ def execute_run(run_directory: Path) -> None:
             config=config.profiling.duplicate_groups,
         )
 
-        duplicate_analysis.exact_duplicate_groups.to_csv(
-            diagnostics_directory / "exact_duplicate_groups.csv",
-            index=False,
-        )
-        duplicate_analysis.proper_near_duplicate_groups.to_csv(
-            diagnostics_directory / "near_duplicate_groups.csv",
-            index=False,
-        )
         duplicate_analysis.near_edges.to_csv(
             diagnostics_directory / "near_duplicate_edges.csv",
             index=False,
         )
-        duplicate_analysis.conflicting_targets.to_csv(
-            diagnostics_directory / "conflicting_duplicate_targets.csv",
-            index=False,
-        )
 
-        # Suspected Derived Relations
         suspected_relations = build_suspected_derived_relations(source_frame, config)
-        suspected_relations.to_csv(
-            diagnostics_directory / "suspected_derived_relations.csv",
-            index=False,
+
+        artifacts = DiagnosticArtifacts(
+            pearson=corr_analysis.pearson,
+            spearman=corr_analysis.spearman,
+            high_correlation_pairs=corr_analysis.high_correlation_pairs,
+            numeric_predictor_dictionary=corr_analysis.numeric_predictor_dictionary,
+            exact_duplicate_groups=duplicate_analysis.exact_duplicate_groups,
+            near_duplicate_groups=duplicate_analysis.proper_near_duplicate_groups,
+            conflicting_duplicate_targets=duplicate_analysis.conflicting_targets,
+            suspected_derived_relations=suspected_relations,
         )
 
-        # Write diagnostics manifest
-        numeric_pred_count = sum(
-            1
-            for name, spec in config.features.items()
-            if name in source_frame.columns
-            and pd.api.types.is_numeric_dtype(source_frame[name])
-        )
-        exact_group_cnt = (
-            int(
-                duplicate_analysis.exact_duplicate_groups[
-                    "duplicate_group_id"
-                ].nunique()
-            )
-            if not duplicate_analysis.exact_duplicate_groups.empty
-            else 0
-        )
-        conflicting_group_cnt = (
-            int(duplicate_analysis.conflicting_targets["signature"].nunique())
-            if not duplicate_analysis.conflicting_targets.empty
-            else 0
-        )
-        near_group_cnt = (
-            int(
-                duplicate_analysis.proper_near_duplicate_groups[
-                    "near_duplicate_group_id"
-                ].nunique()
-            )
-            if not duplicate_analysis.proper_near_duplicate_groups.empty
-            else 0
-        )
-
-        diagnostics_manifest_path = diagnostics_directory / "diagnostics_manifest.json"
-        write_json_atomic(
-            diagnostics_manifest_path,
-            {
-                "correlation": {
-                    "enabled": config.profiling.correlation.enabled,
-                    "pearson_enabled": config.profiling.correlation.pearson,
-                    "spearman_enabled": config.profiling.correlation.spearman,
-                    "review_threshold": config.profiling.correlation.review_threshold,
-                    "warning_threshold": config.profiling.correlation.warning_threshold,
-                    "numeric_predictor_count": numeric_pred_count,
-                    "high_correlation_pair_count": high_corr_count,
-                },
-                "duplicate_groups": {
-                    "enabled": config.profiling.duplicate_groups.enabled,
-                    "rounding_decimals": (
-                        config.profiling.duplicate_groups.rounding_decimals
-                    ),
-                    "near_duplicate_threshold": (
-                        config.profiling.duplicate_groups.near_duplicate_threshold
-                    ),
-                    "maximum_pairwise_rows": (
-                        config.profiling.duplicate_groups.maximum_pairwise_rows
-                    ),
-                    "exact_group_count": exact_group_cnt,
-                    "near_group_count": near_group_cnt,
-                    "conflicting_target_group_count": conflicting_group_cnt,
-                },
-                "derived_relations": {
-                    "enabled": True,
-                    "suspected_relation_count": len(suspected_relations),
-                },
-                "validation": {
-                    "strategy": config.validation.strategy,
-                    "outer_splits": config.validation.outer_splits,
-                    "outer_repeats": config.validation.outer_repeats,
-                    "inner_splits": config.validation.inner_splits,
-                    "duplicate_group_policy": config.validation.duplicate_group_policy,
-                    "split_integrity_passed": True,
-                },
-                "near_duplicate_semantics": {
-                    "algorithm": "canonical_match_fraction_connected_components",
-                    "rounding_decimals": config.profiling.duplicate_groups.rounding_decimals,
-                    "threshold": config.profiling.duplicate_groups.near_duplicate_threshold,
-                    "threshold_inclusive": True,
-                    "missing_equals_missing": True,
-                    "categorical_normalization": "strip_outer_whitespace",
-                    "grouping": "connected_components",
-                    "maximum_pairwise_rows": config.profiling.duplicate_groups.maximum_pairwise_rows,
-                    "target_included": False,
-                },
+        diagnostics_manifest_path = write_diagnostics(
+            artifacts=artifacts,
+            output_directory=diagnostics_directory,
+            context_kind="run",
+            settings=config.profiling.correlation,
+            data_path=config.data_path,
+            target=config.target,
+            run_id=run.get("run_id"),
+            row_count=len(X),
+            column_count=len(source_frame.columns),
+            predictor_count=len(X.columns),
+            data_hash=run["data_hash"],
+            validation_info={
+                "strategy": config.validation.strategy,
+                "outer_splits": config.validation.outer_splits,
+                "outer_repeats": config.validation.outer_repeats,
+                "inner_splits": config.validation.inner_splits,
+                "duplicate_group_policy": config.validation.duplicate_group_policy,
+                "split_integrity_passed": True,
             },
         )
 
-        # Apply Policy Enforcement
         policy_result = apply_duplicate_group_policy(
             policy=config.validation.duplicate_group_policy,
             configured_groups=groups,
@@ -426,7 +363,6 @@ def execute_run(run_directory: Path) -> None:
 
         effective_groups = policy_result.effective_groups
 
-        # Persist effective validation groups CSV if grouping is active or configured groups exist
         if effective_groups is not None:
             exact_dup_map = (
                 dict(
@@ -497,6 +433,14 @@ def execute_run(run_directory: Path) -> None:
                 index=False,
                 encoding="utf-8",
             )
+
+        exact_group_cnt = policy_result.exact_group_count
+        near_group_cnt = policy_result.proper_near_group_count
+        conflicting_group_cnt = (
+            int(duplicate_analysis.conflicting_targets["signature"].nunique())
+            if not duplicate_analysis.conflicting_targets.empty
+            else 0
+        )
 
         write_json_atomic(
             run_directory / "data_manifest.json",

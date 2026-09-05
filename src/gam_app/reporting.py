@@ -53,6 +53,19 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
     if diagnostics_dir.exists():
         sections.append("<h2>Predictor diagnostics</h2>")
 
+        diagnostics_manifest_path = diagnostics_dir / "diagnostics_manifest.json"
+        if diagnostics_manifest_path.exists():
+            diag_manifest = json.loads(
+                diagnostics_manifest_path.read_text(encoding="utf-8")
+            )
+            schema_ver = diag_manifest.get("schema_version", "1.0")
+            ctx_kind = diag_manifest.get("context", {}).get("kind", "run")
+            sections.append(
+                f"<p><strong>Diagnostics schema version:</strong> "
+                f"{html.escape(schema_ver)} | "
+                f"<strong>Context:</strong> {html.escape(ctx_kind)}</p>"
+            )
+
         high_pairs_path = diagnostics_dir / "high_correlation_pairs.csv"
         if high_pairs_path.exists():
             high_pairs = pd.read_csv(high_pairs_path)
@@ -64,11 +77,15 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
                 )
             else:
                 display_columns = [
+                    "rank",
                     "left",
                     "right",
                     "pearson",
                     "spearman",
                     "maximum_absolute_correlation",
+                    "dominant_method",
+                    "complete_pair_count",
+                    "complete_pair_fraction",
                     "severity",
                     "declared_derivation_relation",
                     "recommended_action",
@@ -85,7 +102,9 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
             "<p><em>High correlation identifies predictor redundancy "
             "or shared structure. It is not an automatic predictor "
             "deletion rule. Penalized prediction may remain stable while "
-            "individual term attribution is not unique.</em></p>"
+            "individual term attribution is not unique. Status 'not_evaluated' "
+            "or 'not_provided' means metadata was unavailable, which does not "
+            "constitute proof that a feature is non-derived.</em></p>"
         )
 
         sections.append("<h3>Duplicate predictor groups</h3>")
@@ -119,8 +138,9 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
             ):
                 conflicting_count = int(conflicting_duplicates["signature"].nunique())
 
+        policy_str = html.escape(config.validation.duplicate_group_policy)
         sections.append(
-            f"<p><strong>Duplicate policy:</strong> {html.escape(config.validation.duplicate_group_policy)}</p>"
+            f"<p><strong>Duplicate policy:</strong> {policy_str}</p>"
         )
         sections.append(
             f"<p><strong>Exact duplicate groups:</strong> {exact_count}</p>"
@@ -129,7 +149,8 @@ def create_reports(config: ExperimentConfig, store: FileRunStore) -> None:
             f"<p><strong>Proper near-duplicate groups:</strong> {near_count}</p>"
         )
         sections.append(
-            f"<p><strong>Conflicting duplicate targets:</strong> {conflicting_count}</p>"
+            f"<p><strong>Conflicting duplicate targets:</strong> "
+            f"{conflicting_count}</p>"
         )
 
         diagnostic_links = [

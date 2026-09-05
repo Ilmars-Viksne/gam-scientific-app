@@ -271,6 +271,11 @@ class ExperimentConfig:
                     f"Derived feature {name!r} must declare derived_from."
                 )
 
+            if spec.derived == "none" and spec.derived_from:
+                raise ConfigurationError(
+                    f"Feature {name!r} has derived='none' but declares derived_from."
+                )
+
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["data_path"] = str(self.data_path)
