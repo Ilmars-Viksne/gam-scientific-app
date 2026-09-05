@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -9,6 +10,10 @@ from typing import Any, Literal
 import yaml
 
 from .exceptions import ConfigurationError
+
+CURRENT_CONFIG_SCHEMA_VERSION = "1.1"
+SUPPORTED_CONFIG_SCHEMA_VERSIONS = ("1.0", "1.1")
+LEGACY_CONFIG_SCHEMA_VERSIONS = ("1.0",)
 
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -106,26 +111,81 @@ class ExperimentConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     primary_metric: Literal["log_loss"] = "log_loss"
-    schema_version: str = "1.1"
+    schema_version: str = CURRENT_CONFIG_SCHEMA_VERSION
 
     def validate(self) -> None:
-        supported_versions = {"1.0", "1.1"}
-        if self.schema_version not in supported_versions:
+        if self.schema_version not in SUPPORTED_CONFIG_SCHEMA_VERSIONS:
             raise ConfigurationError(
-                f"Unsupported schema_version {self.schema_version!r}. "
-                f"Supported versions: {sorted(supported_versions)}."
+                f"Unsupported configuration schema_version {self.schema_version!r}. "
+                f"This installation supports: {', '.join(SUPPORTED_CONFIG_SCHEMA_VERSIONS)}. "
+                f"The current schema is {CURRENT_CONFIG_SCHEMA_VERSION!r}. "
+                "If this file was created by an older version, use "
+                "'gam-app migrate-config'. If it was created by a newer version, "
+                "upgrade gam-app rather than removing or changing schema_version manually."
             )
 
         if not self.name.strip():
             raise ConfigurationError("Experiment name cannot be empty.")
         if not self.target.strip():
             raise ConfigurationError("Target column cannot be empty.")
-        if self.validation.outer_splits < 2 or self.validation.inner_splits < 2:
-            raise ConfigurationError("Inner and outer splits must be at least 2.")
+        if self.validation.outer_splits < 2:
+            raise ConfigurationError("validation.outer_splits must be at least 2.")
+        if self.validation.inner_splits < 2:
+            raise ConfigurationError("validation.inner_splits must be at least 2.")
         if self.validation.outer_repeats < 1:
-            raise ConfigurationError("outer_repeats must be at least 1.")
+            raise ConfigurationError("validation.outer_repeats must be at least 1.")
+        if self.validation.test_size is not None and self.validation.test_size < 1:
+            raise ConfigurationError(
+                "validation.test_size must be at least 1 when configured."
+            )
+        if self.validation.gap < 0:
+            raise ConfigurationError("validation.gap cannot be negative.")
         if self.execution.workers < 1:
             raise ConfigurationError("execution.workers must be at least 1.")
+
+        # Data-role column uniqueness check
+        configured_roles = {
+            "target": self.target,
+            "row_id": self.row_id,
+            "group": self.group_column,
+            "time": self.time_column,
+        }
+
+        used_columns: dict[str, list[str]] = {}
+        for role, column in configured_roles.items():
+            if column is not None:
+                used_columns.setdefault(column, []).append(role)
+
+        conflicts = {
+            column: roles for column, roles in used_columns.items() if len(roles) > 1
+        }
+
+        if conflicts:
+            details = "; ".join(
+                f"{column!r}: {', '.join(roles)}"
+                for column, roles in sorted(conflicts.items())
+            )
+            raise ConfigurationError(
+                f"Data-role columns must be distinct. Conflicts: {details}."
+            )
+
+        reserved_columns = {
+            column for column in configured_roles.values() if column is not None
+        }
+
+        active_reserved_predictors = sorted(
+            name
+            for name, specification in self.features.items()
+            if name in reserved_columns and specification.role != "exclude"
+        )
+
+        if active_reserved_predictors:
+            raise ConfigurationError(
+                "Target, row-id, group, and time columns cannot be used as "
+                "active model predictors. Set their feature role to 'exclude' "
+                "or remove them from features: "
+                f"{active_reserved_predictors}."
+            )
 
         active = {
             name for name, spec in self.features.items() if spec.role != "exclude"
@@ -162,21 +222,23 @@ class ExperimentConfig:
             raise ConfigurationError("Every C value must be positive.")
 
         # Profiling correlation validation
-        if not 0.0 <= self.profiling.correlation.review_threshold <= 1.0:
+        rev_thresh = self.profiling.correlation.review_threshold
+        if not math.isfinite(rev_thresh) or not (0.0 < rev_thresh <= 1.0):
             raise ConfigurationError(
-                "profiling.correlation.review_threshold must be between 0 and 1."
+                "profiling.correlation.review_threshold must be between 0 (exclusive) and 1."
             )
-        if not 0.0 <= self.profiling.correlation.warning_threshold <= 1.0:
+        warn_thresh = self.profiling.correlation.warning_threshold
+        if not math.isfinite(warn_thresh) or not (0.0 < warn_thresh <= 1.0):
             raise ConfigurationError(
-                "profiling.correlation.warning_threshold must be between 0 and 1."
+                "profiling.correlation.warning_threshold must be between 0 (exclusive) and 1."
             )
         if (
             self.profiling.correlation.warning_threshold
             < self.profiling.correlation.review_threshold
         ):
             raise ConfigurationError(
-                "The correlation warning threshold cannot be smaller "
-                "than the review threshold."
+                "profiling.correlation.warning_threshold must be greater than "
+                "or equal to profiling.correlation.review_threshold."
             )
         if self.profiling.correlation.minimum_complete_pairs < 2:
             raise ConfigurationError("minimum_complete_pairs must be at least 2.")
@@ -207,29 +269,30 @@ class ExperimentConfig:
                 "are used only to detect conflicting duplicate targets."
             )
 
-        # Validation strategy and policy checks
-        if self.validation.gap < 0:
-            raise ConfigurationError("validation.gap cannot be negative.")
-
-        if (
-            self.validation.duplicate_group_policy in {"group", "error"}
-            and not self.profiling.duplicate_groups.enabled
-        ):
+        # Duplicate group policy checks
+        if not self.profiling.duplicate_groups.enabled:
             raise ConfigurationError(
-                "validation.duplicate_group_policy requires "
-                "profiling.duplicate_groups.enabled=true."
+                f"validation.duplicate_group_policy='{self.validation.duplicate_group_policy}' "
+                "requires profiling.duplicate_groups.enabled=true."
             )
 
-        if (
-            self.validation.duplicate_group_policy == "group"
-            and self.validation.strategy != "stratified_group"
-        ):
-            raise ConfigurationError(
-                "validation.duplicate_group_policy='group' requires "
-                "validation.strategy='stratified_group'."
-            )
+        # Strategy-specific parameter validation
+        if self.validation.strategy == "stratified":
+            if self.validation.duplicate_group_policy == "group":
+                raise ConfigurationError(
+                    "validation.duplicate_group_policy='group' requires "
+                    "validation.strategy='stratified_group'."
+                )
+            if self.validation.gap != 0:
+                raise ConfigurationError(
+                    "validation.gap applies only when validation.strategy='time'."
+                )
+            if self.validation.test_size is not None:
+                raise ConfigurationError(
+                    "validation.test_size applies only when validation.strategy='time'."
+                )
 
-        if self.validation.strategy == "stratified_group":
+        elif self.validation.strategy == "stratified_group":
             configured_grouping = self.group_column is not None
             duplicate_grouping = (
                 self.validation.duplicate_group_policy == "group"
@@ -241,15 +304,28 @@ class ExperimentConfig:
                     "data.group or validation.duplicate_group_policy='group' "
                     "with profiling.duplicate_groups.enabled=true."
                 )
+            if self.validation.gap != 0:
+                raise ConfigurationError(
+                    "validation.gap applies only when validation.strategy='time'."
+                )
+            if self.validation.test_size is not None:
+                raise ConfigurationError(
+                    "validation.test_size applies only when validation.strategy='time'."
+                )
 
-        if self.validation.strategy == "time":
+        elif self.validation.strategy == "time":
             if self.time_column is None:
                 raise ConfigurationError(
-                    "data.time is required when validation.strategy is 'time'."
+                    "data.time is required when validation.strategy='time'."
                 )
             if self.validation.outer_repeats != 1:
                 raise ConfigurationError(
                     "Time-aware validation requires outer_repeats=1."
+                )
+            if self.validation.duplicate_group_policy == "group":
+                raise ConfigurationError(
+                    "validation.duplicate_group_policy='group' is not supported "
+                    "with validation.strategy='time'. Use 'report' or 'error'."
                 )
 
         # Feature derivation validation
@@ -286,13 +362,15 @@ def _tuples(values: Any) -> tuple[Any, ...]:
     return tuple(values or ())
 
 
-def load_config(path: Path) -> ExperimentConfig:
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    base = path.parent.resolve()
+def parse_config_payload(
+    payload: Mapping[str, Any],
+    *,
+    base_directory: Path,
+) -> ExperimentConfig:
     data_raw = payload["data"]
     data_path = Path(data_raw["path"])
     if not data_path.is_absolute():
-        data_path = (base / data_path).resolve()
+        data_path = (base_directory / data_path).resolve()
 
     features = {
         name: FeatureConfig(
@@ -306,7 +384,7 @@ def load_config(path: Path) -> ExperimentConfig:
             description=spec.get("description"),
             unit=spec.get("unit"),
         )
-        for name, spec in payload["features"].items()
+        for name, spec in payload.get("features", {}).items()
     }
 
     models = tuple(
@@ -341,12 +419,13 @@ def load_config(path: Path) -> ExperimentConfig:
 
     execution = ExecutionConfig(**payload.get("execution", {}))
 
+    exp_raw = payload.get("experiment", {})
     config = ExperimentConfig(
         schema_version=str(payload.get("schema_version", "1.0")),
-        name=payload["experiment"]["name"],
-        primary_metric=payload["experiment"].get("primary_metric", "log_loss"),
+        name=exp_raw.get("name", ""),
+        primary_metric=exp_raw.get("primary_metric", "log_loss"),
         data_path=data_path,
-        target=data_raw["target"],
+        target=data_raw.get("target", ""),
         row_id=data_raw.get("row_id"),
         group_column=data_raw.get("group"),
         time_column=data_raw.get("time"),
@@ -357,6 +436,13 @@ def load_config(path: Path) -> ExperimentConfig:
         search=search,
         execution=execution,
     )
+    return config
+
+
+def load_config(path: Path) -> ExperimentConfig:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    base = path.parent.resolve()
+    config = parse_config_payload(payload, base_directory=base)
     config.validate()
     return config
 

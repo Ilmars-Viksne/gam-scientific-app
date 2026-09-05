@@ -10,8 +10,18 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import yaml
 
-from .config import load_config
+from .config import (
+    CURRENT_CONFIG_SCHEMA_VERSION,
+    dump_config_dict,
+    load_config,
+    parse_config_payload,
+)
+from .config_migration import (
+    assess_config_schema,
+    migrate_config_payload,
+)
 from .data import infer_role, load_table, profile_data, save_profile
 from .diagnostics import (
     StandaloneDiagnosticSettings,
@@ -24,6 +34,10 @@ from .logistic import extract_class_score_parameters
 from .reporting import create_reports
 from .run_store import FileRunStore
 from .workflow import create_run, execute_run
+
+
+def _value_or_default(value: int | None, default: int) -> int:
+    return default if value is None else value
 
 
 def _preset(name: str) -> dict:
@@ -108,20 +122,25 @@ def command_configure(args) -> None:
 
     features: dict[str, dict[str, Any]] = {}
 
+    reserved_cols = {args.row_id, args.group, args.time} - {None}
+
     for name in frame.columns:
         if name == args.target:
             continue
 
-        recommended, reason = infer_role(frame[name])
-        role = recommended
+        if name in reserved_cols:
+            role = "exclude"
+        else:
+            recommended, reason = infer_role(frame[name])
+            role = recommended
 
-        if not args.non_interactive:
-            print(f"\n{name}: {reason}; recommended role={recommended}")
+            if not args.non_interactive:
+                print(f"\n{name}: {reason}; recommended role={recommended}")
 
-            role = _ask(
-                "Role (smooth/linear/categorical/exclude)",
-                recommended,
-            )
+                role = _ask(
+                    "Role (smooth/linear/categorical/exclude)",
+                    recommended,
+                )
 
         if role not in {
             "smooth",
@@ -164,8 +183,27 @@ def command_configure(args) -> None:
 
     preset_values: dict[str, Any] = _preset(preset)
 
+    outer_splits = _value_or_default(
+        args.outer_splits,
+        preset_values["outer_splits"],
+    )
+
+    inner_splits = _value_or_default(
+        args.inner_splits,
+        preset_values["inner_splits"],
+    )
+
+    default_outer_repeats = (
+        1 if args.validation_strategy == "time" else preset_values["outer_repeats"]
+    )
+
+    outer_repeats = _value_or_default(
+        args.outer_repeats,
+        default_outer_repeats,
+    )
+
     payload: dict[str, Any] = {
-        "schema_version": "1.1",
+        "schema_version": CURRENT_CONFIG_SCHEMA_VERSION,
         "experiment": {
             "name": args.name or args.data.stem,
             "primary_metric": "log_loss",
@@ -190,33 +228,30 @@ def command_configure(args) -> None:
         ],
         "profiling": {
             "correlation": {
-                "enabled": True,
+                "enabled": args.correlation_enabled,
                 "pearson": True,
                 "spearman": True,
-                "review_threshold": 0.75,
-                "warning_threshold": 0.90,
-                "minimum_complete_pairs": 3,
+                "review_threshold": args.review_correlation,
+                "warning_threshold": args.warn_correlation,
+                "minimum_complete_pairs": args.minimum_complete_pairs,
             },
             "duplicate_groups": {
-                "enabled": True,
-                "rounding_decimals": 8,
-                "near_duplicate_threshold": 0.98,
+                "enabled": args.duplicate_groups_enabled,
+                "rounding_decimals": args.near_duplicate_decimals,
+                "near_duplicate_threshold": args.near_duplicate_threshold,
+                "maximum_pairwise_rows": args.maximum_pairwise_rows,
                 "include_target_in_signature": False,
             },
         },
         "validation": {
             "strategy": args.validation_strategy,
-            "outer_splits": preset_values["outer_splits"],
-            "outer_repeats": (
-                1
-                if args.validation_strategy == "time"
-                else preset_values["outer_repeats"]
-            ),
-            "inner_splits": preset_values["inner_splits"],
-            "random_state": 42,
+            "outer_splits": outer_splits,
+            "outer_repeats": outer_repeats,
+            "inner_splits": inner_splits,
+            "random_state": args.random_state,
             "gap": args.gap,
-            "test_size": None,
-            "duplicate_group_policy": "report",
+            "test_size": args.test_size,
+            "duplicate_group_policy": args.duplicate_group_policy,
         },
         "search": {
             "n_knots": preset_values["n_knots"],
@@ -234,30 +269,258 @@ def command_configure(args) -> None:
         },
     }
 
-    write_yaml_atomic(
-        args.output,
+    config = parse_config_payload(
         payload,
+        base_directory=args.output.resolve().parent,
     )
 
+    config.validate()
+
+    write_yaml_atomic(
+        args.output,
+        dump_config_dict(config),
+    )
+
+    print()
+    print("Configuration summary")
+    print("---------------------")
+    print(f"Experiment: {config.name}")
+    print(f"Validation strategy: {config.validation.strategy}")
+    print(
+        "Configured group column: "
+        f"{config.group_column if config.group_column else 'not configured'}"
+    )
+    print(
+        "Configured time column: "
+        f"{config.time_column if config.time_column else 'not configured'}"
+    )
+    print(f"Duplicate policy: {config.validation.duplicate_group_policy}")
+    if config.validation.strategy == "time":
+        print(
+            f"Outer validation: {config.validation.outer_splits} folds × "
+            f"{config.validation.outer_repeats} repeat"
+        )
+        print(f"Inner validation: {config.validation.inner_splits} folds")
+        print(f"Temporal gap: {config.validation.gap}")
+        print(
+            "Temporal test size: "
+            f"{config.validation.test_size if config.validation.test_size is not None else 'default'}"
+        )
+        print("Random state: not used by time validation")
+    else:
+        print(
+            f"Outer validation: {config.validation.outer_splits} folds × "
+            f"{config.validation.outer_repeats} repeats"
+        )
+        print(f"Inner validation: {config.validation.inner_splits} folds")
+        print(f"Random state: {config.validation.random_state}")
+    print(
+        "Correlation diagnostics: "
+        f"{'enabled' if config.profiling.correlation.enabled else 'disabled'}"
+    )
+    print(
+        "Duplicate diagnostics: "
+        f"{'enabled' if config.profiling.duplicate_groups.enabled else 'disabled'}"
+    )
+    print(
+        "Near-duplicate threshold: "
+        f"{config.profiling.duplicate_groups.near_duplicate_threshold}"
+    )
+    print(f"Search preset: {preset}")
+    print()
     print(f"Configuration written to {args.output.resolve()}")
 
 
+def command_migrate_config(args) -> None:
+    if args.input.resolve() == args.output.resolve() and not args.overwrite:
+        raise FileExistsError(
+            f"Input and output paths refer to the same file: {args.output}. "
+            "Use --overwrite to replace it."
+        )
+
+    if (
+        args.output.exists()
+        and not args.overwrite
+        and args.input.resolve() != args.output.resolve()
+    ):
+        raise FileExistsError(
+            f"Output already exists: {args.output}. Use --overwrite to replace it."
+        )
+
+    payload = yaml.safe_load(args.input.read_text(encoding="utf-8"))
+
+    result = migrate_config_payload(
+        payload,
+        input_directory=args.input.resolve().parent,
+        output_directory=args.output.resolve().parent,
+    )
+
+    config = parse_config_payload(
+        result.payload,
+        base_directory=args.output.resolve().parent,
+    )
+
+    config.validate()
+
+    write_yaml_atomic(
+        args.output,
+        dump_config_dict(config),
+    )
+
+    print(f"Migrated schema {result.source_version} to {result.target_version}.")
+
+    for change in result.changes:
+        print(f"- {change}")
+
+    print(
+        "Review validation strategy, grouping, temporal settings, "
+        "and duplicate policy before running the migrated experiment."
+    )
+
+
 def command_plan(args) -> None:
+    from .io_utils import sha256_file
+    from .planning import evaluate_plan_feasibility
+
+    payload = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    assessment = assess_config_schema(payload)
+
     config = load_config(args.config)
-    main = len(config.search.n_knots) * len(config.search.degree) * len(config.search.C)
-    pairwise = main * len(config.search.interaction_scale)
-    outer = config.validation.outer_splits * config.validation.outer_repeats
-    rows = []
-    for model in config.models:
-        candidates = main if model.interactions == "none" else pairwise
-        fits = (
-            candidates * config.validation.inner_splits * outer
-            + candidates * config.validation.inner_splits
+    feasibility, dataset_info = evaluate_plan_feasibility(config)
+
+    warnings_list = list(feasibility.warnings)
+    if assessment.migration_recommended:
+        mig_msg = (
+            f"Configuration schema {assessment.detected_version} is supported for compatibility. "
+            f"Current schema is {assessment.current_version}. "
+            f"Consider running 'gam-app migrate-config --input {args.config} --output <output.yaml>'."
         )
-        rows.append(
-            {"model": model.id, "candidates": candidates, "estimated_fits": fits}
+        warnings_list.append(mig_msg)
+
+    # Compute search candidate numbers & fit estimates if feasible
+    models_estimates = []
+    if feasibility.passed:
+        main = (
+            len(config.search.n_knots)
+            * len(config.search.degree)
+            * len(config.search.C)
         )
-    print(pd.DataFrame(rows).to_string(index=False))
+        pairwise = main * len(config.search.interaction_scale)
+        outer = config.validation.outer_splits * config.validation.outer_repeats
+
+        for model in config.models:
+            candidates = main if model.interactions == "none" else pairwise
+            nested_cv_fits = candidates * config.validation.inner_splits * outer
+            final_selection_fits = candidates * config.validation.inner_splits
+            estimated_total_fits = nested_cv_fits + final_selection_fits
+
+            models_estimates.append(
+                {
+                    "model": model.id,
+                    "candidates": candidates,
+                    "nested_cv_fits": nested_cv_fits,
+                    "final_selection_fits": final_selection_fits,
+                    "estimated_total_fits": estimated_total_fits,
+                }
+            )
+
+    if getattr(args, "json", False):
+        data_hash = (
+            sha256_file(config.data_path) if config.data_path.is_file() else None
+        )
+        out_json = {
+            "schema_name": "gam_plan",
+            "schema_version": "1.0",
+            "feasible": feasibility.passed,
+            "configuration": {
+                "schema_version": config.schema_version,
+                "path": str(args.config),
+            },
+            "dataset": {
+                "path": str(config.data_path),
+                "sha256": data_hash,
+                "row_count": dataset_info.get("row_count"),
+                "class_count": dataset_info.get("class_count"),
+            },
+            "validation": {
+                "strategy": config.validation.strategy,
+                "outer_splits": config.validation.outer_splits,
+                "outer_repeats": config.validation.outer_repeats,
+                "inner_splits": config.validation.inner_splits,
+                "random_state": config.validation.random_state,
+                "group_column": config.group_column,
+                "time_column": config.time_column,
+                "duplicate_group_policy": config.validation.duplicate_group_policy,
+                "effective_group_count": dataset_info.get("effective_group_count"),
+            },
+            "checks": [check.to_dict() for check in feasibility.checks],
+            "warnings": warnings_list,
+            "models": models_estimates if feasibility.passed else [],
+        }
+        print(json.dumps(out_json, indent=2))
+        if not feasibility.passed:
+            sys.exit(2)
+        return
+
+    # Text output mode
+    print("Validation design")
+    print("-----------------")
+    print(f"Strategy: {config.validation.strategy}")
+    print(f"Outer folds: {config.validation.outer_splits}")
+    print(f"Outer repeats: {config.validation.outer_repeats}")
+    print(f"Inner folds: {config.validation.inner_splits}")
+    if config.group_column or config.validation.duplicate_group_policy == "group":
+        print(
+            f"Group column: {config.group_column if config.group_column else 'duplicate-derived'}"
+        )
+        if "effective_group_count" in dataset_info:
+            print(f"Effective groups: {dataset_info['effective_group_count']}")
+    if config.time_column:
+        print(f"Time column: {config.time_column}")
+        print(f"Gap: {config.validation.gap}")
+        print(f"Test size: {config.validation.test_size}")
+    if "row_count" in dataset_info:
+        print(f"Rows: {dataset_info['row_count']}")
+    if "class_count" in dataset_info:
+        print(f"Classes: {dataset_info['class_count']}")
+    print()
+
+    print("Validation feasibility")
+    print("----------------------")
+    check_rows = []
+    for c in feasibility.checks:
+        check_rows.append(
+            {
+                "check": c.check,
+                "status": c.level.upper(),
+                "observed": c.observed,
+                "required": c.required,
+            }
+        )
+    print(pd.DataFrame(check_rows).to_string(index=False))
+    print()
+
+    if warnings_list:
+        print("Warnings:")
+        for w in warnings_list:
+            print(f"- {w}")
+        print()
+
+    if not feasibility.passed:
+        print("The configured validation design is not feasible.")
+        print()
+        for c in feasibility.checks:
+            if c.level == "fail":
+                print(f"- [{c.check}] {c.details}")
+        print()
+        print(
+            "Fit estimates were not calculated because the validation design is not feasible."
+        )
+        sys.exit(2)
+
+    print("Candidate fit estimation")
+    print("------------------------")
+    print(pd.DataFrame(models_estimates).to_string(index=False))
 
 
 def command_run(args) -> None:
@@ -2324,9 +2587,142 @@ def build_parser() -> argparse.ArgumentParser:
         "--preset", choices=["quick", "standard", "thorough"], default="standard"
     )
     configure.add_argument("--non-interactive", action="store_true")
-    configure.set_defaults(func=command_configure)
+    configure.add_argument(
+        "--outer-splits",
+        type=int,
+        default=None,
+        help="Number of outer validation folds. Defaults to search preset.",
+    )
+    configure.add_argument(
+        "--outer-repeats",
+        type=int,
+        default=None,
+        help="Number of outer validation repeats. Defaults to search preset, except time defaults to 1.",
+    )
+    configure.add_argument(
+        "--inner-splits",
+        type=int,
+        default=None,
+        help="Number of inner hyperparameter-selection folds. Defaults to search preset.",
+    )
+    configure.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed used by randomized validation strategies.",
+    )
+    configure.add_argument(
+        "--test-size",
+        type=int,
+        default=None,
+        help="Temporal test-window size. Applies only when --validation-strategy=time.",
+    )
+    configure.add_argument(
+        "--duplicate-group-policy",
+        choices=["report", "error", "group"],
+        default="report",
+        help="Duplicate handling policy: report only, fail on duplicate groups, or merge duplicate constraints into grouped validation.",
+    )
+    configure.add_argument(
+        "--review-correlation",
+        type=float,
+        default=0.75,
+        help="Absolute correlation threshold for review-level findings.",
+    )
+    configure.add_argument(
+        "--warn-correlation",
+        type=float,
+        default=0.90,
+        help="Absolute correlation threshold for warning-level findings.",
+    )
+    configure.add_argument(
+        "--minimum-complete-pairs",
+        type=int,
+        default=3,
+        help="Minimum complete observations required for correlation analysis.",
+    )
+    configure.add_argument(
+        "--near-duplicate-decimals",
+        type=int,
+        default=8,
+        help="Decimal precision used to canonicalize numeric duplicate values.",
+    )
+    configure.add_argument(
+        "--near-duplicate-threshold",
+        type=float,
+        default=0.98,
+        help="Inclusive predictor-match fraction required for near-duplicate relations.",
+    )
+    configure.add_argument(
+        "--maximum-pairwise-rows",
+        type=int,
+        default=10_000,
+        help="Maximum dataset size allowed for exact pairwise near-duplicate analysis.",
+    )
+
+    duplicate_group_toggle = configure.add_mutually_exclusive_group()
+    duplicate_group_toggle.add_argument(
+        "--duplicate-groups",
+        dest="duplicate_groups_enabled",
+        action="store_true",
+        help="Enable exact and near-duplicate diagnostics.",
+    )
+    duplicate_group_toggle.add_argument(
+        "--no-duplicate-groups",
+        dest="duplicate_groups_enabled",
+        action="store_false",
+        help="Disable duplicate-group diagnostics.",
+    )
+
+    correlation_toggle = configure.add_mutually_exclusive_group()
+    correlation_toggle.add_argument(
+        "--correlation-diagnostics",
+        dest="correlation_enabled",
+        action="store_true",
+        help="Enable correlation diagnostics.",
+    )
+    correlation_toggle.add_argument(
+        "--no-correlation-diagnostics",
+        dest="correlation_enabled",
+        action="store_false",
+        help="Disable correlation diagnostics.",
+    )
+
+    configure.set_defaults(
+        duplicate_groups_enabled=True,
+        correlation_enabled=True,
+        func=command_configure,
+    )
+    migrate = sub.add_parser(
+        "migrate-config",
+        help="Upgrade a supported legacy configuration to the current schema.",
+    )
+    migrate.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to the legacy configuration YAML file.",
+    )
+    migrate.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination path for the migrated configuration YAML file.",
+    )
+    migrate.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite output file if it already exists.",
+    )
+    migrate.set_defaults(func=command_migrate_config)
+
     plan = sub.add_parser("plan")
     plan.add_argument("--config", type=Path, required=True)
+    plan.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the plan and feasibility results as JSON.",
+    )
     plan.set_defaults(func=command_plan)
     run = sub.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
