@@ -1037,6 +1037,39 @@ python -m compileall src tests
 
 ---
 
+## Diagnostics Output Contract
+
+The app produces standardized, machine-verifiable diagnostics artifacts and a schema-versioned manifest (`diagnostics_manifest.json`, version `1.0`):
+
+### Canonical Artifact Inventory
+- `correlation_pearson.csv` (`correlation_matrix/1.0`): Pearson correlation matrix.
+- `correlation_spearman.csv` (`correlation_matrix/1.0`): Spearman correlation matrix.
+- `high_correlation_pairs.csv` (`high_correlation_pairs/1.0`): Ranked high-correlation predictor pairs.
+- `numeric_predictor_dictionary.csv` (`predictor_dictionary/1.0`): Predictor data dictionary.
+  > *For backward compatibility, the predictor dictionary is stored as `numeric_predictor_dictionary.csv`. Despite the historical filename, the artifact may include both numeric and nonnumeric predictors. Use the `numeric` column to distinguish them.*
+- `suspected_derived_relations.csv` (`suspected_derived_relations/1.0`): Suspected exact, affine, log, square, and square root functional relations.
+- `exact_duplicate_groups.csv` (`exact_duplicate_groups/1.0`): Exact predictor duplicate groups.
+- `near_duplicate_groups.csv` (`near_duplicate_groups/1.0`): Proper near-duplicate predictor groups.
+- `conflicting_duplicate_targets.csv` (`conflicting_duplicate_targets/1.0`): Exact duplicate predictor groups with conflicting target labels.
+
+### High-Correlation Pair Ordering & Dominant Correlation
+- **Ordering**: Pairs exceeding `review_threshold` are sorted deterministically by:
+  1. Severity (`warning` before `review`)
+  2. Maximum absolute correlation (descending)
+  3. Complete-pair count (descending)
+  4. Left predictor name (ascending)
+  5. Right predictor name (ascending)
+- **Dominant method & tie rules**: Each pair identifies `dominant_method` (`pearson`, `spearman`, `tie`, `none`). When Pearson and Spearman magnitudes match within $10^{-12}$, `dominant_method` is `"tie"` and `dominant_correlation` is `null` (empty in CSV).
+- **Trigger methods**: Format uses fixed method order (`pearson|spearman`).
+- **Coverage**: Includes `complete_pair_count`, `row_count`, and `complete_pair_fraction`.
+
+### Data Dictionary & Derivation Status Vocabularies
+- **`metadata_status`**: `provided` vs `not_provided`.
+- **`derived_status`**: `declared`, `not_declared`, `suspected`, `not_evaluated`.
+- **Derivation distinction**: Standalone execution without a supplied data dictionary produces `metadata_status = not_provided` and `derived_status = not_evaluated`. Absence of metadata is recorded as `not_evaluated`, not as a negative finding (`not_declared`).
+
+---
+
 ## Duplicate Analysis and Validation Policies
 
 The app provides formal duplicate analysis and policy enforcement (GAM-103 & GAM-104):

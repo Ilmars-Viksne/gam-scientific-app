@@ -117,7 +117,7 @@ def test_declared_derivation_is_reported(tmp_path: Path) -> None:
         )
     ].iloc[0]
 
-    assert bool(row["declared_derivation_relation"])
+    assert row["declared_derivation_relation"] == "yes"
 
 
 def test_constant_predictor_does_not_create_high_pair(tmp_path: Path) -> None:
@@ -134,3 +134,61 @@ def test_constant_predictor_does_not_create_high_pair(tmp_path: Path) -> None:
     if not analysis.high_pairs.empty:
         assert "constant" not in set(analysis.high_pairs["left"])
         assert "constant" not in set(analysis.high_pairs["right"])
+
+
+def test_high_pair_ordering_warning_before_review_and_rank_consecutive(
+    tmp_path: Path,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "x1": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "x2_warning": [1.0, 2.0, 3.0, 4.0, 5.0],  # corr 1.0
+            "x3_review": [1.0, 2.0, 3.0, 4.0, 4.5],  # corr ~0.8
+            "target": ["A", "A", "B", "B", "B"],
+        }
+    )
+    config = make_correlation_test_config(tmp_path, frame)
+    analysis = calculate_correlation_analysis(frame, config)
+
+    high_pairs = analysis.high_pairs
+    assert not high_pairs.empty
+    assert list(high_pairs["rank"]) == list(range(1, len(high_pairs) + 1))
+
+    severities = list(high_pairs["severity"])
+    if "warning" in severities and "review" in severities:
+        first_review = severities.index("review")
+        last_warning = len(severities) - 1 - severities[::-1].index("warning")
+        assert last_warning < first_review
+
+
+def test_dominant_method_tie_produces_none_dominant_correlation(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "x1": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "x2": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "target": ["A", "A", "B", "B", "B"],
+        }
+    )
+    config = make_correlation_test_config(tmp_path, frame)
+    analysis = calculate_correlation_analysis(frame, config)
+
+    high_pairs = analysis.high_pairs
+    assert not high_pairs.empty
+    row = high_pairs.iloc[0]
+    assert row["dominant_method"] == "tie"
+    assert pd.isna(row["dominant_correlation"])
+
+
+def test_trigger_methods_uses_pipe_delimiter(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "x1": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "x2": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "target": ["A", "A", "B", "B", "B"],
+        }
+    )
+    config = make_correlation_test_config(tmp_path, frame)
+    analysis = calculate_correlation_analysis(frame, config)
+
+    row = analysis.high_pairs.iloc[0]
+    assert row["trigger_methods"] == "pearson|spearman"

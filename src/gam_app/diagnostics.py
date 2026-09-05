@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -10,9 +11,31 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from . import __version__
 from .config import DuplicateGroupConfig, ExperimentConfig
+from .diagnostic_schema import (
+    CONFIG_TO_DIAGNOSTIC_DERIVED_STATUS,
+    CONFLICTING_DUPLICATE_TARGET_COLUMNS,
+    DIAGNOSTICS_SCHEMA_NAME,
+    DIAGNOSTICS_SCHEMA_VERSION,
+    DOMINANT_CORRELATION_TOLERANCE,
+    EXACT_DUPLICATE_GROUP_COLUMNS,
+    HIGH_CORRELATION_PAIR_COLUMNS,
+    NEAR_DUPLICATE_GROUP_COLUMNS,
+    PREDICTOR_DICTIONARY_COLUMNS,
+    SEVERITY_ORDER,
+    SUSPECTED_DERIVED_RELATION_COLUMNS,
+    DeclaredDerivationRelation,
+    DiagnosticArtifacts,
+    DiagnosticContextKind,
+    DiagnosticFeatureMetadata,
+    DiagnosticSeverity,
+    DominantMethod,
+    build_artifact_manifest_entry,
+    format_logical_dataset_path,
+)
 from .exceptions import DataValidationError
-from .io_utils import write_json_atomic
+from .io_utils import utc_now, write_csv_atomic, write_json_atomic
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +55,10 @@ class StandaloneDiagnosticSettings:
     near_duplicate_decimals: int = 8
     near_duplicate_threshold: float = 0.98
     maximum_pairwise_rows: int = 10_000
+
+    @property
+    def rounding_decimals(self) -> int:
+        return self.near_duplicate_decimals
 
     def validate(self) -> None:
         if not (0.0 <= self.correlation_review_threshold <= 1.0):
@@ -78,6 +105,14 @@ class StandaloneDiagnostics:
     near_duplicate_groups: pd.DataFrame
     conflicting_duplicate_targets: pd.DataFrame
 
+    @property
+    def high_pairs(self) -> pd.DataFrame:
+        return self.high_correlation_pairs
+
+    @property
+    def numeric_summary(self) -> pd.DataFrame:
+        return self.numeric_predictor_dictionary
+
 
 @dataclass(frozen=True, slots=True)
 class CorrelationAnalysis:
@@ -85,6 +120,14 @@ class CorrelationAnalysis:
     spearman: pd.DataFrame
     high_pairs: pd.DataFrame
     numeric_summary: pd.DataFrame
+
+    @property
+    def high_correlation_pairs(self) -> pd.DataFrame:
+        return self.high_pairs
+
+    @property
+    def numeric_predictor_dictionary(self) -> pd.DataFrame:
+        return self.numeric_summary
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,13 +205,17 @@ def build_exact_predictor_signatures(X: pd.DataFrame) -> pd.Series:
     canonical = canonicalize_predictors(X, decimals=None)
     signatures: list[str] = []
 
-    for row in canonical.itertuples(index=False, name=None):
-        raw = json.dumps(
-            list(row),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+    if canonical.columns.empty:
+        empty_hash = hashlib.sha256(b"[]").hexdigest()
+        signatures = [empty_hash] * len(X)
+    else:
+        for row in canonical.itertuples(index=False, name=None):
+            raw = json.dumps(
+                list(row),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
 
     return pd.Series(signatures, index=X.index, name="exact_predictor_signature")
 
@@ -187,13 +234,10 @@ def exact_duplicate_group_report(
     group_sizes = frame.groupby("signature", sort=False)["row_id"].transform("size")
     duplicates = frame.loc[group_sizes > 1].copy()
     if duplicates.empty:
-        return pd.DataFrame(
-            columns=["duplicate_group_id", "signature", "group_size", "row_id"]
-        )
+        return pd.DataFrame(columns=list(EXACT_DUPLICATE_GROUP_COLUMNS))
 
     duplicates["group_size"] = group_sizes.loc[group_sizes > 1].to_numpy()
 
-    # Deterministic group ID based on SHA-256 of sorted member row IDs
     dup_ids: dict[str, str] = {}
     for sig, sub in duplicates.groupby("signature", sort=True):
         sig_str = str(sig)
@@ -204,18 +248,12 @@ def exact_duplicate_group_report(
 
     duplicates["duplicate_group_id"] = duplicates["signature"].map(dup_ids)
 
-    return (
-        duplicates[
-            [
-                "duplicate_group_id",
-                "signature",
-                "group_size",
-                "row_id",
-            ]
-        ]
+    res = (
+        duplicates[list(EXACT_DUPLICATE_GROUP_COLUMNS)]
         .sort_values(["duplicate_group_id", "row_id"], kind="stable")
         .reset_index(drop=True)
     )
+    return res
 
 
 def conflicting_duplicate_target_report(
@@ -236,16 +274,15 @@ def conflicting_duplicate_target_report(
     )
     conflicts = frame.loc[target_counts > 1].copy()
     if conflicts.empty:
-        return pd.DataFrame(
-            columns=["signature", "target", "row_id", "distinct_target_count"]
-        )
+        return pd.DataFrame(columns=list(CONFLICTING_DUPLICATE_TARGET_COLUMNS))
 
     conflicts["distinct_target_count"] = target_counts[target_counts > 1].to_numpy()
-    return (
-        conflicts[["signature", "target", "row_id", "distinct_target_count"]]
+    res = (
+        conflicts[list(CONFLICTING_DUPLICATE_TARGET_COLUMNS)]
         .sort_values(["signature", "target", "row_id"], kind="stable")
         .reset_index(drop=True)
     )
+    return res
 
 
 def build_near_duplicate_signatures(
@@ -256,60 +293,19 @@ def build_near_duplicate_signatures(
     canonical = canonicalize_predictors(X, decimals=decimals)
     signatures: list[str] = []
 
-    for row in canonical.itertuples(index=False, name=None):
-        raw = json.dumps(
-            list(row),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+    if canonical.columns.empty:
+        empty_hash = hashlib.sha256(b"[]").hexdigest()
+        signatures = [empty_hash] * len(X)
+    else:
+        for row in canonical.itertuples(index=False, name=None):
+            raw = json.dumps(
+                list(row),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
 
     return pd.Series(signatures, index=X.index, name="near_duplicate_signature")
-
-
-def duplicate_signature_report(
-    *,
-    signatures: pd.Series,
-    row_ids: pd.Series,
-    report_prefix: str = "near_duplicate",
-) -> pd.DataFrame:
-    frame = pd.DataFrame(
-        {
-            "row_id": row_ids.astype(str).to_numpy(),
-            "signature": signatures.to_numpy(),
-        }
-    )
-    group_sizes = frame.groupby("signature", sort=False)["row_id"].transform("size")
-    duplicates = frame.loc[group_sizes > 1].copy()
-    if duplicates.empty:
-        return pd.DataFrame(
-            columns=[f"{report_prefix}_group_id", "signature", "group_size", "row_id"]
-        )
-
-    duplicates["group_size"] = group_sizes.loc[group_sizes > 1].to_numpy()
-
-    prefix_ids: dict[str, str] = {}
-    for sig, sub in duplicates.groupby("signature", sort=True):
-        sig_str = str(sig)
-        sorted_members = sorted(sub["row_id"].tolist())
-        member_key = "\x1f".join(sorted_members)
-        hash_id = hashlib.sha256(member_key.encode("utf-8")).hexdigest()[:12]
-        prefix_ids[sig_str] = f"{report_prefix}_{hash_id}"
-
-    duplicates[f"{report_prefix}_group_id"] = duplicates["signature"].map(prefix_ids)
-
-    return (
-        duplicates[
-            [
-                f"{report_prefix}_group_id",
-                "signature",
-                "group_size",
-                "row_id",
-            ]
-        ]
-        .sort_values([f"{report_prefix}_group_id", "row_id"], kind="stable")
-        .reset_index(drop=True)
-    )
 
 
 def analyze_duplicate_groups(
@@ -321,26 +317,12 @@ def analyze_duplicate_groups(
     row_count = len(X)
     str_row_ids = row_ids.astype(str).to_numpy()
 
-    # 1. Exact duplicates & conflicting targets
     exact_signatures = build_exact_predictor_signatures(X)
     exact_duplicate_groups = exact_duplicate_group_report(X, row_ids)
     conflicting_targets = conflicting_duplicate_target_report(X, y, row_ids)
 
     if not config.enabled:
-        empty_near_groups = pd.DataFrame(
-            columns=[
-                "near_duplicate_group_id",
-                "row_id",
-                "exact_signature",
-                "canonical_signature",
-                "group_size",
-                "distinct_exact_signature_count",
-                "matched_column_count",
-                "compared_column_count",
-                "match_fraction",
-                "is_exact_duplicate_member",
-            ]
-        )
+        empty_near_groups = pd.DataFrame(columns=list(NEAR_DUPLICATE_GROUP_COLUMNS))
         empty_edges = pd.DataFrame(
             columns=[
                 "left_row_id",
@@ -359,7 +341,6 @@ def analyze_duplicate_groups(
             conflicting_targets=conflicting_targets,
         )
 
-    # Check pairwise limit
     if row_count > config.maximum_pairwise_rows:
         raise DataValidationError(
             "Near-duplicate analysis requires an exact pairwise scan, "
@@ -370,20 +351,22 @@ def analyze_duplicate_groups(
             "near-duplicate analysis."
         )
 
-    # 2. Canonicalize for near duplicates
     canonical_df = canonicalize_predictors(X, decimals=config.rounding_decimals)
     canonical_signatures: list[str] = []
-    for row in canonical_df.itertuples(index=False, name=None):
-        raw = json.dumps(
-            list(row),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        canonical_signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+    if canonical_df.columns.empty:
+        empty_hash = hashlib.sha256(b"[]").hexdigest()
+        canonical_signatures = [empty_hash] * len(X)
+    else:
+        for row in canonical_df.itertuples(index=False, name=None):
+            raw = json.dumps(
+                list(row),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            canonical_signatures.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
 
     canonical_sig_series = pd.Series(canonical_signatures, index=X.index)
 
-    # 3. Pairwise similarity comparison
     col_names = list(canonical_df.columns)
     compared_column_count = len(col_names)
     matrix = canonical_df.to_numpy(dtype=str)
@@ -438,13 +421,11 @@ def analyze_duplicate_groups(
             ]
         )
 
-    # 4. Build connected components & filter proper near duplicate groups
     component_members: dict[int, list[int]] = {}
     for idx in range(row_count):
-        root = uf.find(idx)
-        component_members.setdefault(root, []).append(idx)
+        root_idx = uf.find(idx)
+        component_members.setdefault(root_idx, []).append(idx)
 
-    # Exact group memberships lookup
     exact_dups_set = (
         set(exact_duplicate_groups["row_id"].tolist())
         if not exact_duplicate_groups.empty
@@ -453,14 +434,13 @@ def analyze_duplicate_groups(
 
     proper_near_rows: list[dict[str, Any]] = []
 
-    for root, members in component_members.items():
+    for _root, members in component_members.items():
         if len(members) < 2:
             continue
 
         member_exact_sigs = [exact_signatures.iloc[m] for m in members]
         distinct_exact_cnt = len(set(member_exact_sigs))
 
-        # A proper near group must contain at least two distinct exact predictor signatures
         if distinct_exact_cnt < 2:
             continue
 
@@ -484,33 +464,22 @@ def analyze_duplicate_groups(
                     "canonical_signature": canon_sig,
                     "group_size": group_size,
                     "distinct_exact_signature_count": distinct_exact_cnt,
-                    "matched_column_count": compared_column_count,  # Reference context
+                    "matched_column_count": compared_column_count,
                     "compared_column_count": compared_column_count,
-                    "match_fraction": 1.0,  # Group wide indicator
+                    "match_fraction": 1.0,
                     "is_exact_duplicate_member": is_exact_dup_member,
                 }
             )
 
     if proper_near_rows:
         proper_near_duplicate_groups = (
-            pd.DataFrame(proper_near_rows)
+            pd.DataFrame(proper_near_rows)[list(NEAR_DUPLICATE_GROUP_COLUMNS)]
             .sort_values(["near_duplicate_group_id", "row_id"], kind="stable")
             .reset_index(drop=True)
         )
     else:
         proper_near_duplicate_groups = pd.DataFrame(
-            columns=[
-                "near_duplicate_group_id",
-                "row_id",
-                "exact_signature",
-                "canonical_signature",
-                "group_size",
-                "distinct_exact_signature_count",
-                "matched_column_count",
-                "compared_column_count",
-                "match_fraction",
-                "is_exact_duplicate_member",
-            ]
+            columns=list(NEAR_DUPLICATE_GROUP_COLUMNS)
         )
 
     return DuplicateAnalysis(
@@ -541,6 +510,62 @@ def numeric_predictor_frame(
     return numeric
 
 
+def feature_metadata_from_config(
+    config: ExperimentConfig,
+    predictors: Sequence[str] | None = None,
+) -> dict[str, DiagnosticFeatureMetadata]:
+    names = predictors if predictors is not None else list(config.features.keys())
+    result: dict[str, DiagnosticFeatureMetadata] = {}
+    for name in names:
+        if name in config.features:
+            spec = config.features[name]
+            derived_status = CONFIG_TO_DIAGNOSTIC_DERIVED_STATUS.get(
+                spec.derived,
+                "not_declared",
+            )
+            result[name] = DiagnosticFeatureMetadata(
+                role=spec.role,
+                derived_status=derived_status,
+                derived_from=spec.derived_from,
+                derivation=spec.derivation,
+                description=spec.description,
+                unit=spec.unit,
+                metadata_status="provided",
+            )
+        else:
+            result[name] = DiagnosticFeatureMetadata(
+                role=None,
+                derived_status="not_evaluated",
+                derived_from=(),
+                derivation=None,
+                description=None,
+                unit=None,
+                metadata_status="not_provided",
+            )
+    return result
+
+
+def standalone_feature_metadata(
+    predictors: Sequence[str],
+) -> dict[str, DiagnosticFeatureMetadata]:
+    return {
+        str(name): DiagnosticFeatureMetadata(
+            role=None,
+            derived_status="not_evaluated",
+            derived_from=(),
+            derivation=None,
+            description=None,
+            unit=None,
+            metadata_status="not_provided",
+        )
+        for name in predictors
+    }
+
+
+def build_empty_high_correlation_pairs() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(HIGH_CORRELATION_PAIR_COLUMNS))
+
+
 def _matrix_value(
     matrix: pd.DataFrame,
     left: str,
@@ -554,169 +579,241 @@ def _matrix_value(
     return float(cast(Any, value))
 
 
-def _correlation_action(
-    *,
-    declared_relation: bool,
-    severity: str,
-) -> str:
-    if declared_relation:
-        return (
-            "Review whether both source and derived representations "
-            "are required in the same model."
-        )
-    if severity == "warning":
-        return (
-            "Investigate redundancy, leakage, and contribution "
-            "stability; compare sensitivity specifications."
-        )
-    return "Review scientific meaning and monitor term stability across outer folds."
-
-
-def _empty_high_pair_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "left",
-            "right",
-            "pearson",
-            "absolute_pearson",
-            "spearman",
-            "absolute_spearman",
-            "maximum_absolute_correlation",
-            "trigger_methods",
-            "complete_pair_count",
-            "left_role",
-            "right_role",
-            "left_derived",
-            "right_derived",
-            "declared_derivation_relation",
-            "severity",
-            "recommended_action",
-        ]
-    )
-
-
 def build_high_correlation_pairs(
     *,
+    numeric: pd.DataFrame,
     pearson: pd.DataFrame,
     spearman: pd.DataFrame,
-    numeric: pd.DataFrame,
-    config: ExperimentConfig,
+    review_threshold: float,
+    warning_threshold: float,
+    feature_metadata: Mapping[str, DiagnosticFeatureMetadata],
 ) -> pd.DataFrame:
-    settings = config.profiling.correlation
     names = list(numeric.columns)
     rows: list[dict[str, Any]] = []
+    row_count = len(numeric)
+
+    default_meta = DiagnosticFeatureMetadata(
+        role=None,
+        derived_status="not_evaluated",
+        derived_from=(),
+        derivation=None,
+        description=None,
+        unit=None,
+        metadata_status="not_provided",
+    )
 
     for left_index, left in enumerate(names):
+        left_meta = feature_metadata.get(left, default_meta)
         for right in names[left_index + 1 :]:
+            right_meta = feature_metadata.get(right, default_meta)
+
             pearson_value = _matrix_value(pearson, left, right)
             spearman_value = _matrix_value(spearman, left, right)
 
-            available_absolute_values = [
-                abs(value)
-                for value in (pearson_value, spearman_value)
-                if value is not None and np.isfinite(value)
-            ]
+            pearson_finite = pearson_value is not None and np.isfinite(pearson_value)
+            spearman_finite = spearman_value is not None and np.isfinite(spearman_value)
+
+            available_absolute_values = []
+            if pearson_finite and pearson_value is not None:
+                available_absolute_values.append(abs(pearson_value))
+            if spearman_finite and spearman_value is not None:
+                available_absolute_values.append(abs(spearman_value))
 
             if not available_absolute_values:
                 continue
 
             maximum = max(available_absolute_values)
 
-            if maximum < settings.review_threshold:
+            if maximum < review_threshold:
                 continue
 
-            trigger_methods: list[str] = []
             if (
-                pearson_value is not None
-                and np.isfinite(pearson_value)
-                and abs(pearson_value) >= settings.review_threshold
+                pearson_finite
+                and spearman_finite
+                and pearson_value is not None
+                and spearman_value is not None
             ):
-                trigger_methods.append("pearson")
+                diff = abs(abs(pearson_value) - abs(spearman_value))
+                if diff <= DOMINANT_CORRELATION_TOLERANCE:
+                    dominant_method: DominantMethod = "tie"
+                    dominant_correlation: float | None = None
+                elif abs(pearson_value) > abs(spearman_value):
+                    dominant_method = "pearson"
+                    dominant_correlation = pearson_value
+                else:
+                    dominant_method = "spearman"
+                    dominant_correlation = spearman_value
+            elif pearson_finite:
+                dominant_method = "pearson"
+                dominant_correlation = pearson_value
+            elif spearman_finite:
+                dominant_method = "spearman"
+                dominant_correlation = spearman_value
+            else:
+                dominant_method = "none"
+                dominant_correlation = None
 
+            triggers: list[str] = []
             if (
-                spearman_value is not None
-                and np.isfinite(spearman_value)
-                and abs(spearman_value) >= settings.review_threshold
+                pearson_finite
+                and pearson_value is not None
+                and abs(pearson_value) >= review_threshold
             ):
-                trigger_methods.append("spearman")
+                triggers.append("pearson")
+            if (
+                spearman_finite
+                and spearman_value is not None
+                and abs(spearman_value) >= review_threshold
+            ):
+                triggers.append("spearman")
+            trigger_methods_str = "|".join(triggers)
 
             complete_pair_count = int(numeric[[left, right]].dropna().shape[0])
-
-            left_spec = config.features[left]
-            right_spec = config.features[right]
-
-            declared_relation = (
-                left in right_spec.derived_from or right in left_spec.derived_from
+            complete_pair_fraction = (
+                complete_pair_count / row_count if row_count > 0 else None
             )
 
-            severity = "warning" if maximum >= settings.warning_threshold else "review"
+            if (
+                left_meta.metadata_status == "provided"
+                and right_meta.metadata_status == "provided"
+            ):
+                declared_relation: DeclaredDerivationRelation = (
+                    "yes"
+                    if (
+                        left in right_meta.derived_from
+                        or right in left_meta.derived_from
+                    )
+                    else "no"
+                )
+            else:
+                declared_relation = "unknown"
+
+            severity: DiagnosticSeverity = (
+                "warning" if maximum >= warning_threshold else "review"
+            )
+
+            if declared_relation == "yes":
+                recommended_action = (
+                    "Review the declared derivation and avoid using both predictors "
+                    "without a documented modelling rationale."
+                )
+            elif severity == "warning":
+                recommended_action = (
+                    "Review for redundancy, unstable attribution, or derived-variable "
+                    "dependence before modelling."
+                )
+            else:
+                recommended_action = (
+                    "Review scientific meaning and monitor term "
+                    "stability across outer folds."
+                )
 
             rows.append(
                 {
                     "left": left,
                     "right": right,
-                    "pearson": pearson_value,
+                    "pearson": pearson_value if pearson_finite else np.nan,
                     "absolute_pearson": (
-                        abs(pearson_value) if pearson_value is not None else np.nan
+                        abs(pearson_value)
+                        if pearson_finite and pearson_value is not None
+                        else np.nan
                     ),
-                    "spearman": spearman_value,
+                    "spearman": spearman_value if spearman_finite else np.nan,
                     "absolute_spearman": (
-                        abs(spearman_value) if spearman_value is not None else np.nan
+                        abs(spearman_value)
+                        if spearman_finite and spearman_value is not None
+                        else np.nan
                     ),
                     "maximum_absolute_correlation": maximum,
-                    "trigger_methods": ",".join(trigger_methods),
+                    "dominant_method": dominant_method,
+                    "dominant_correlation": dominant_correlation,
+                    "trigger_methods": trigger_methods_str,
                     "complete_pair_count": complete_pair_count,
-                    "left_role": left_spec.role,
-                    "right_role": right_spec.role,
-                    "left_derived": left_spec.derived,
-                    "right_derived": right_spec.derived,
+                    "row_count": row_count,
+                    "complete_pair_fraction": complete_pair_fraction,
+                    "left_role": left_meta.role or "",
+                    "right_role": right_meta.role or "",
+                    "left_derived_status": left_meta.derived_status,
+                    "right_derived_status": right_meta.derived_status,
+                    "left_derived_from": ",".join(left_meta.derived_from),
+                    "right_derived_from": ",".join(right_meta.derived_from),
                     "declared_derivation_relation": declared_relation,
                     "severity": severity,
-                    "recommended_action": _correlation_action(
-                        declared_relation=declared_relation,
-                        severity=severity,
-                    ),
+                    "recommended_action": recommended_action,
                 }
             )
 
     if not rows:
-        return _empty_high_pair_frame()
+        return build_empty_high_correlation_pairs()
 
-    return (
-        pd.DataFrame(rows)
-        .sort_values(
-            ["maximum_absolute_correlation", "left", "right"],
-            ascending=[False, True, True],
+    df = pd.DataFrame(rows)
+    df["_severity_order"] = df["severity"].map(SEVERITY_ORDER)
+
+    df = (
+        df.sort_values(
+            [
+                "_severity_order",
+                "maximum_absolute_correlation",
+                "complete_pair_count",
+                "left",
+                "right",
+            ],
+            ascending=[True, False, False, True, True],
             kind="stable",
         )
+        .drop(columns="_severity_order")
         .reset_index(drop=True)
     )
 
+    df.insert(0, "rank", np.arange(1, len(df) + 1, dtype=np.int64))
 
-def _numeric_summary(
-    numeric: pd.DataFrame,
-    config: ExperimentConfig,
+    return df[list(HIGH_CORRELATION_PAIR_COLUMNS)]
+
+
+def build_predictor_dictionary(
+    *,
+    predictors: pd.DataFrame,
+    feature_metadata: Mapping[str, DiagnosticFeatureMetadata],
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for name in numeric.columns:
-        spec = config.features[name]
-        series = numeric[name]
+
+    default_meta = DiagnosticFeatureMetadata(
+        role=None,
+        derived_status="not_evaluated",
+        derived_from=(),
+        derivation=None,
+        description=None,
+        unit=None,
+        metadata_status="not_provided",
+    )
+
+    for name in predictors.columns:
+        series = predictors[name]
+        meta = feature_metadata.get(str(name), default_meta)
+
         rows.append(
             {
-                "predictor": name,
-                "role": spec.role,
+                "predictor": str(name),
+                "role": meta.role if meta.role is not None else "",
                 "dtype": str(series.dtype),
+                "numeric": bool(pd.api.types.is_numeric_dtype(series)),
                 "non_missing": int(series.notna().sum()),
                 "missing": int(series.isna().sum()),
                 "unique": int(series.nunique(dropna=True)),
-                "derived": spec.derived,
-                "derived_from": ",".join(spec.derived_from),
-                "derivation": spec.derivation,
-                "description": spec.description,
-                "unit": spec.unit,
+                "metadata_status": meta.metadata_status,
+                "derived_status": meta.derived_status,
+                "derived_from": ",".join(meta.derived_from),
+                "derivation": meta.derivation or "",
+                "description": meta.description or "",
+                "unit": meta.unit or "",
             }
         )
-    return pd.DataFrame(rows)
+
+    if not rows:
+        return pd.DataFrame(columns=list(PREDICTOR_DICTIONARY_COLUMNS))
+
+    df = pd.DataFrame(rows)
+    return df[list(PREDICTOR_DICTIONARY_COLUMNS)]
 
 
 def calculate_correlation_analysis(
@@ -726,13 +823,23 @@ def calculate_correlation_analysis(
     settings = config.profiling.correlation
     numeric = numeric_predictor_frame(frame, config)
 
+    feature_metadata = feature_metadata_from_config(
+        config,
+        predictors=list(frame.columns),
+    )
+
+    predictor_dictionary = build_predictor_dictionary(
+        predictors=frame,
+        feature_metadata=feature_metadata,
+    )
+
     if numeric.empty:
         empty = pd.DataFrame()
         return CorrelationAnalysis(
             pearson=empty,
             spearman=empty,
-            high_pairs=_empty_high_pair_frame(),
-            numeric_summary=_numeric_summary(numeric, config),
+            high_pairs=build_empty_high_correlation_pairs(),
+            numeric_summary=predictor_dictionary,
         )
 
     pearson = (
@@ -754,17 +861,19 @@ def calculate_correlation_analysis(
     )
 
     high_pairs = build_high_correlation_pairs(
+        numeric=numeric,
         pearson=pearson,
         spearman=spearman,
-        numeric=numeric,
-        config=config,
+        review_threshold=settings.review_threshold,
+        warning_threshold=settings.warning_threshold,
+        feature_metadata=feature_metadata,
     )
 
     return CorrelationAnalysis(
         pearson=pearson,
         spearman=spearman,
         high_pairs=high_pairs,
-        numeric_summary=_numeric_summary(numeric, config),
+        numeric_summary=predictor_dictionary,
     )
 
 
@@ -798,29 +907,44 @@ def save_correlation_analysis(
     )
 
 
-# Suspected Derived Relations
-
-
 def build_suspected_derived_relations(
     frame: pd.DataFrame,
-    config: ExperimentConfig,
+    config: ExperimentConfig | None = None,
+    *,
+    minimum_complete_pairs: int = 3,
+    feature_metadata: Mapping[str, DiagnosticFeatureMetadata] | None = None,
 ) -> pd.DataFrame:
-    numeric = numeric_predictor_frame(frame, config)
-    names = list(numeric.columns)
-    min_pairs = config.profiling.correlation.minimum_complete_pairs
+    if config is not None:
+        numeric = numeric_predictor_frame(frame, config)
+        min_pairs = config.profiling.correlation.minimum_complete_pairs
+        meta = feature_metadata_from_config(config, list(frame.columns))
+    else:
+        numeric_cols = [
+            col for col in frame.columns if pd.api.types.is_numeric_dtype(frame[col])
+        ]
+        numeric = frame.loc[:, numeric_cols].copy()
+        for col in numeric.columns:
+            numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+        min_pairs = minimum_complete_pairs
+        meta = (
+            dict(feature_metadata)
+            if feature_metadata is not None
+            else standalone_feature_metadata(list(frame.columns))
+        )
 
+    names = list(numeric.columns)
     rows: list[dict[str, Any]] = []
 
     atol = 1e-10
     rtol = 1e-8
 
     for cand in names:
-        cand_spec = config.features[cand]
+        cand_meta = meta.get(cand, standalone_feature_metadata([cand])[cand])
         for src in names:
             if cand == src:
                 continue
 
-            src_spec = config.features[src]
+            src_meta = meta.get(src, standalone_feature_metadata([src])[src])
             pair_df = numeric[[src, cand]].dropna()
             count = len(pair_df)
             if count < min_pairs:
@@ -829,7 +953,6 @@ def build_suspected_derived_relations(
             x = pair_df[src].to_numpy(dtype=float)
             y = pair_df[cand].to_numpy(dtype=float)
 
-            # Skip constant source
             if np.isclose(x.min(), x.max(), atol=1e-12):
                 continue
 
@@ -842,7 +965,7 @@ def build_suspected_derived_relations(
                 spearman_val = None
 
             is_declared_derived = (
-                src in cand_spec.derived_from or cand in src_spec.derived_from
+                src in cand_meta.derived_from or cand in src_meta.derived_from
             )
             status = "declared_match" if is_declared_derived else "suspected"
 
@@ -1007,135 +1130,11 @@ def build_suspected_derived_relations(
                     continue
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "candidate",
-                "source",
-                "relation_type",
-                "status",
-                "complete_pair_count",
-                "parameter_a",
-                "parameter_b",
-                "maximum_absolute_error",
-                "maximum_relative_error",
-                "correlation_pearson",
-                "correlation_spearman",
-                "evidence",
-                "recommended_action",
-            ]
-        )
+        return pd.DataFrame(columns=list(SUSPECTED_DERIVED_RELATION_COLUMNS))
 
     return (
-        pd.DataFrame(rows)
+        pd.DataFrame(rows)[list(SUSPECTED_DERIVED_RELATION_COLUMNS)]
         .sort_values(["candidate", "source"], kind="stable")
-        .reset_index(drop=True)
-    )
-
-
-def _empty_standalone_high_correlation_pairs() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "left",
-            "right",
-            "pearson",
-            "absolute_pearson",
-            "spearman",
-            "absolute_spearman",
-            "maximum_absolute_correlation",
-            "trigger_methods",
-            "complete_pair_count",
-            "severity",
-            "recommended_action",
-        ]
-    )
-
-
-def _build_standalone_high_correlation_pairs(
-    *,
-    numeric: pd.DataFrame,
-    pearson: pd.DataFrame,
-    spearman: pd.DataFrame,
-    settings: StandaloneDiagnosticSettings,
-) -> pd.DataFrame:
-    names = list(numeric.columns)
-    rows: list[dict[str, object]] = []
-
-    for left_index, left in enumerate(names):
-        for right in names[left_index + 1 :]:
-            pearson_value = _matrix_value(pearson, left, right)
-            spearman_value = _matrix_value(spearman, left, right)
-
-            available = [
-                abs(value)
-                for value in (pearson_value, spearman_value)
-                if value is not None and np.isfinite(value)
-            ]
-
-            if not available:
-                continue
-
-            maximum = max(available)
-
-            if maximum < settings.correlation_review_threshold:
-                continue
-
-            trigger_methods: list[str] = []
-
-            if (
-                pearson_value is not None
-                and abs(pearson_value) >= settings.correlation_review_threshold
-            ):
-                trigger_methods.append("pearson")
-
-            if (
-                spearman_value is not None
-                and abs(spearman_value) >= settings.correlation_review_threshold
-            ):
-                trigger_methods.append("spearman")
-
-            complete_pair_count = int(numeric[[left, right]].dropna().shape[0])
-
-            severity = (
-                "warning"
-                if maximum >= settings.correlation_warning_threshold
-                else "review"
-            )
-
-            rows.append(
-                {
-                    "left": left,
-                    "right": right,
-                    "pearson": (pearson_value if pearson_value is not None else np.nan),
-                    "absolute_pearson": (
-                        abs(pearson_value) if pearson_value is not None else np.nan
-                    ),
-                    "spearman": (
-                        spearman_value if spearman_value is not None else np.nan
-                    ),
-                    "absolute_spearman": (
-                        abs(spearman_value) if spearman_value is not None else np.nan
-                    ),
-                    "maximum_absolute_correlation": maximum,
-                    "trigger_methods": ",".join(trigger_methods),
-                    "complete_pair_count": complete_pair_count,
-                    "severity": severity,
-                    "recommended_action": (
-                        "Review redundancy, derivation, leakage, and contribution "
-                        "stability. Do not remove a predictor automatically."
-                    ),
-                }
-            )
-
-    if not rows:
-        return _empty_standalone_high_correlation_pairs()
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values(
-            ["maximum_absolute_correlation", "left", "right"],
-            ascending=[False, True, True],
-            kind="stable",
-        )
         .reset_index(drop=True)
     )
 
@@ -1180,32 +1179,21 @@ def calculate_standalone_diagnostics(
         min_periods=settings.minimum_complete_pairs,
     )
 
-    high_pairs = _build_standalone_high_correlation_pairs(
+    feature_meta = standalone_feature_metadata(list(predictors.columns))
+
+    high_pairs = build_high_correlation_pairs(
         numeric=numeric,
         pearson=pearson,
         spearman=spearman,
-        settings=settings,
+        review_threshold=settings.correlation_review_threshold,
+        warning_threshold=settings.correlation_warning_threshold,
+        feature_metadata=feature_meta,
     )
 
-    dictionary_rows: list[dict[str, object]] = []
-
-    for column in predictors.columns:
-        series = predictors[column]
-        dictionary_rows.append(
-            {
-                "predictor": str(column),
-                "dtype": str(series.dtype),
-                "numeric": pd.api.types.is_numeric_dtype(series),
-                "non_missing": int(series.notna().sum()),
-                "missing": int(series.isna().sum()),
-                "unique": int(series.nunique(dropna=True)),
-                "derived_status": "not_declared",
-                "derived_from": "",
-                "derivation": "",
-            }
-        )
-
-    numeric_dictionary = pd.DataFrame(dictionary_rows)
+    predictor_dictionary = build_predictor_dictionary(
+        predictors=predictors,
+        feature_metadata=feature_meta,
+    )
 
     duplicate_config = DuplicateGroupConfig(
         enabled=True,
@@ -1221,29 +1209,17 @@ def calculate_standalone_diagnostics(
         config=duplicate_config,
     )
 
-    suspected_relations = pd.DataFrame(
-        columns=[
-            "candidate",
-            "source",
-            "relation_type",
-            "status",
-            "complete_pair_count",
-            "parameter_a",
-            "parameter_b",
-            "maximum_absolute_error",
-            "maximum_relative_error",
-            "pearson",
-            "spearman",
-            "evidence",
-            "recommended_action",
-        ]
+    suspected_relations = build_suspected_derived_relations(
+        predictors,
+        minimum_complete_pairs=settings.minimum_complete_pairs,
+        feature_metadata=feature_meta,
     )
 
     return StandaloneDiagnostics(
         pearson=pearson,
         spearman=spearman,
         high_correlation_pairs=high_pairs,
-        numeric_predictor_dictionary=numeric_dictionary,
+        numeric_predictor_dictionary=predictor_dictionary,
         suspected_derived_relations=suspected_relations,
         exact_duplicate_groups=analysis.exact_duplicate_groups,
         near_duplicate_groups=analysis.proper_near_duplicate_groups,
@@ -1251,112 +1227,476 @@ def calculate_standalone_diagnostics(
     )
 
 
-def write_standalone_diagnostics(
+def to_diagnostic_artifacts(
+    obj: DiagnosticArtifacts | CorrelationAnalysis | StandaloneDiagnostics,
+) -> DiagnosticArtifacts:
+    if isinstance(obj, DiagnosticArtifacts):
+        return obj
+
+    if isinstance(obj, StandaloneDiagnostics):
+        return DiagnosticArtifacts(
+            pearson=obj.pearson,
+            spearman=obj.spearman,
+            high_correlation_pairs=obj.high_correlation_pairs,
+            numeric_predictor_dictionary=obj.numeric_predictor_dictionary,
+            exact_duplicate_groups=obj.exact_duplicate_groups,
+            near_duplicate_groups=obj.near_duplicate_groups,
+            conflicting_duplicate_targets=obj.conflicting_duplicate_targets,
+            suspected_derived_relations=obj.suspected_derived_relations,
+        )
+
+    if isinstance(obj, CorrelationAnalysis):
+        return DiagnosticArtifacts(
+            pearson=obj.pearson,
+            spearman=obj.spearman,
+            high_correlation_pairs=obj.high_pairs,
+            numeric_predictor_dictionary=obj.numeric_summary,
+            exact_duplicate_groups=pd.DataFrame(
+                columns=list(EXACT_DUPLICATE_GROUP_COLUMNS)
+            ),
+            near_duplicate_groups=pd.DataFrame(
+                columns=list(NEAR_DUPLICATE_GROUP_COLUMNS)
+            ),
+            conflicting_duplicate_targets=pd.DataFrame(
+                columns=list(CONFLICTING_DUPLICATE_TARGET_COLUMNS)
+            ),
+            suspected_derived_relations=pd.DataFrame(
+                columns=list(SUSPECTED_DERIVED_RELATION_COLUMNS)
+            ),
+        )
+
+    raise TypeError(
+        f"Cannot convert object of type {type(obj).__name__} to DiagnosticArtifacts."
+    )
+
+
+def write_diagnostics(
     *,
-    diagnostics: StandaloneDiagnostics,
+    artifacts: DiagnosticArtifacts | CorrelationAnalysis | StandaloneDiagnostics,
     output_directory: Path,
-    settings: StandaloneDiagnosticSettings,
-) -> None:
+    context_kind: DiagnosticContextKind,
+    settings: Any = None,
+    data_path: Path | None = None,
+    target: str | None = None,
+    run_id: str | None = None,
+    model_id: str | None = None,
+    command: str | None = None,
+    row_count: int | None = None,
+    column_count: int | None = None,
+    predictor_count: int | None = None,
+    data_hash: str | None = None,
+    validation_info: dict[str, Any] | None = None,
+    split_integrity_info: dict[str, Any] | None = None,
+) -> Path:
+    arts = to_diagnostic_artifacts(artifacts)
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    diagnostics.pearson.to_csv(
-        output_directory / "correlation_pearson.csv",
-        index=True,
-        index_label="predictor",
-        encoding="utf-8",
-        float_format="%.17g",
+    # 1. Write CSV files atomically
+    p_path = output_directory / "correlation_pearson.csv"
+    if not arts.pearson.empty:
+        arts.pearson.to_csv(
+            p_path,
+            index=True,
+            index_label="predictor",
+            encoding="utf-8",
+            float_format="%.17g",
+        )
+    else:
+        pd.DataFrame().to_csv(
+            p_path, index=True, index_label="predictor", encoding="utf-8"
+        )
+
+    s_path = output_directory / "correlation_spearman.csv"
+    if not arts.spearman.empty:
+        arts.spearman.to_csv(
+            s_path,
+            index=True,
+            index_label="predictor",
+            encoding="utf-8",
+            float_format="%.17g",
+        )
+    else:
+        pd.DataFrame().to_csv(
+            s_path, index=True, index_label="predictor", encoding="utf-8"
+        )
+
+    h_path = output_directory / "high_correlation_pairs.csv"
+    write_csv_atomic(
+        arts.high_correlation_pairs, h_path, index=False, float_format="%.17g"
     )
 
-    diagnostics.spearman.to_csv(
-        output_directory / "correlation_spearman.csv",
-        index=True,
-        index_label="predictor",
-        encoding="utf-8",
-        float_format="%.17g",
+    d_path = output_directory / "numeric_predictor_dictionary.csv"
+    write_csv_atomic(arts.numeric_predictor_dictionary, d_path, index=False)
+
+    s_rel_path = output_directory / "suspected_derived_relations.csv"
+    write_csv_atomic(
+        arts.suspected_derived_relations, s_rel_path, index=False, float_format="%.17g"
     )
 
-    diagnostics.high_correlation_pairs.to_csv(
-        output_directory / "high_correlation_pairs.csv",
-        index=False,
-        encoding="utf-8",
-        float_format="%.17g",
+    ex_path = output_directory / "exact_duplicate_groups.csv"
+    write_csv_atomic(arts.exact_duplicate_groups, ex_path, index=False)
+
+    nr_path = output_directory / "near_duplicate_groups.csv"
+    write_csv_atomic(arts.near_duplicate_groups, nr_path, index=False)
+
+    c_path = output_directory / "conflicting_duplicate_targets.csv"
+    write_csv_atomic(arts.conflicting_duplicate_targets, c_path, index=False)
+
+    # 2. Build Artifact Inventory
+    artifact_entries = [
+        build_artifact_manifest_entry(
+            artifact_id="pearson_matrix",
+            relative_path="correlation_pearson.csv",
+            media_type="text/csv",
+            schema_id="correlation_matrix/1.0",
+            file_path=p_path,
+            row_count=len(arts.pearson),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="spearman_matrix",
+            relative_path="correlation_spearman.csv",
+            media_type="text/csv",
+            schema_id="correlation_matrix/1.0",
+            file_path=s_path,
+            row_count=len(arts.spearman),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="high_correlation_pairs",
+            relative_path="high_correlation_pairs.csv",
+            media_type="text/csv",
+            schema_id="high_correlation_pairs/1.0",
+            file_path=h_path,
+            row_count=len(arts.high_correlation_pairs),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="predictor_dictionary",
+            relative_path="numeric_predictor_dictionary.csv",
+            media_type="text/csv",
+            schema_id="predictor_dictionary/1.0",
+            file_path=d_path,
+            row_count=len(arts.numeric_predictor_dictionary),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="suspected_derived_relations",
+            relative_path="suspected_derived_relations.csv",
+            media_type="text/csv",
+            schema_id="suspected_derived_relations/1.0",
+            file_path=s_rel_path,
+            row_count=len(arts.suspected_derived_relations),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="exact_duplicate_groups",
+            relative_path="exact_duplicate_groups.csv",
+            media_type="text/csv",
+            schema_id="exact_duplicate_groups/1.0",
+            file_path=ex_path,
+            row_count=len(arts.exact_duplicate_groups),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="near_duplicate_groups",
+            relative_path="near_duplicate_groups.csv",
+            media_type="text/csv",
+            schema_id="near_duplicate_groups/1.0",
+            file_path=nr_path,
+            row_count=len(arts.near_duplicate_groups),
+        ),
+        build_artifact_manifest_entry(
+            artifact_id="conflicting_duplicate_targets",
+            relative_path="conflicting_duplicate_targets.csv",
+            media_type="text/csv",
+            schema_id="conflicting_duplicate_targets/1.0",
+            file_path=c_path,
+            row_count=len(arts.conflicting_duplicate_targets),
+        ),
+    ]
+
+    # 3. Assemble Manifest Sections
+    high_pairs_df = arts.high_correlation_pairs
+    warning_cnt = (
+        int((high_pairs_df["severity"] == "warning").sum())
+        if not high_pairs_df.empty and "severity" in high_pairs_df.columns
+        else 0
+    )
+    review_cnt = (
+        int((high_pairs_df["severity"] == "review").sum())
+        if not high_pairs_df.empty and "severity" in high_pairs_df.columns
+        else 0
     )
 
-    diagnostics.numeric_predictor_dictionary.to_csv(
-        output_directory / "numeric_predictor_dictionary.csv",
-        index=False,
-        encoding="utf-8",
+    # Correlation parameters
+    review_thresh = getattr(
+        settings,
+        "review_threshold",
+        getattr(settings, "correlation_review_threshold", 0.75),
     )
-
-    diagnostics.suspected_derived_relations.to_csv(
-        output_directory / "suspected_derived_relations.csv",
-        index=False,
-        encoding="utf-8",
-        float_format="%.17g",
+    warn_thresh = getattr(
+        settings,
+        "warning_threshold",
+        getattr(settings, "correlation_warning_threshold", 0.90),
     )
-
-    diagnostics.exact_duplicate_groups.to_csv(
-        output_directory / "exact_duplicate_groups.csv",
-        index=False,
-        encoding="utf-8",
+    min_pairs = getattr(settings, "minimum_complete_pairs", 3)
+    corr_enabled = (
+        getattr(settings, "enabled", True) if hasattr(settings, "enabled") else True
     )
+    pearson_enabled = getattr(settings, "pearson", True)
+    spearman_enabled = getattr(settings, "spearman", True)
 
-    diagnostics.near_duplicate_groups.to_csv(
-        output_directory / "near_duplicate_groups.csv",
-        index=False,
-        encoding="utf-8",
-    )
+    num_pred_cnt = len(arts.pearson.columns) if not arts.pearson.empty else 0
+    evaluated_pairs = (num_pred_cnt * (num_pred_cnt - 1)) // 2
 
-    diagnostics.conflicting_duplicate_targets.to_csv(
-        output_directory / "conflicting_duplicate_targets.csv",
-        index=False,
-        encoding="utf-8",
-    )
-
-    write_json_atomic(
-        output_directory / "diagnostics_manifest.json",
-        {
-            "correlation": {
-                "pearson_enabled": True,
-                "spearman_enabled": True,
-                "review_threshold": settings.correlation_review_threshold,
-                "warning_threshold": settings.correlation_warning_threshold,
-                "minimum_complete_pairs": settings.minimum_complete_pairs,
-                "numeric_predictor_count": len(diagnostics.pearson.columns),
-                "high_correlation_pair_count": len(diagnostics.high_correlation_pairs),
-            },
-            "derived_relations": {
-                "enabled": False,
-                "implementation_status": "deferred",
-                "suspected_relation_count": 0,
-            },
-            "duplicate_groups": {
-                "near_duplicate_decimals": settings.near_duplicate_decimals,
-                "exact_group_count": (
-                    int(
-                        diagnostics.exact_duplicate_groups[
-                            "duplicate_group_id"
-                        ].nunique()
-                    )
-                    if not diagnostics.exact_duplicate_groups.empty
-                    else 0
-                ),
-                "near_group_count": (
-                    int(
-                        diagnostics.near_duplicate_groups[
-                            "near_duplicate_group_id"
-                        ].nunique()
-                    )
-                    if not diagnostics.near_duplicate_groups.empty
-                    else 0
-                ),
-                "conflicting_target_group_count": (
-                    int(
-                        diagnostics.conflicting_duplicate_targets["signature"].nunique()
-                    )
-                    if not diagnostics.conflicting_duplicate_targets.empty
-                    else 0
-                ),
-            },
+    corr_analysis_payload = {
+        "status": "completed" if corr_enabled else "disabled",
+        "methods": {
+            "pearson": pearson_enabled,
+            "spearman": spearman_enabled,
         },
+        "parameters": {
+            "review_threshold": review_thresh,
+            "warning_threshold": warn_thresh,
+            "minimum_complete_pairs": min_pairs,
+            "threshold_inclusive": True,
+        },
+        "ordering": [
+            {"field": "severity_rank", "direction": "ascending"},
+            {"field": "maximum_absolute_correlation", "direction": "descending"},
+            {"field": "complete_pair_count", "direction": "descending"},
+            {"field": "left", "direction": "ascending"},
+            {"field": "right", "direction": "ascending"},
+        ],
+        "results": {
+            "numeric_predictor_count": num_pred_cnt,
+            "evaluated_pair_count": evaluated_pairs,
+            "high_correlation_pair_count": len(arts.high_correlation_pairs),
+            "warning_pair_count": warning_cnt,
+            "review_pair_count": review_cnt,
+        },
+    }
+
+    # Duplicate parameters
+    dup_rounding = getattr(
+        settings, "rounding_decimals", getattr(settings, "near_duplicate_decimals", 8)
+    )
+    dup_thresh = getattr(settings, "near_duplicate_threshold", 0.98)
+    dup_max_rows = getattr(settings, "maximum_pairwise_rows", 10000)
+    dup_enabled = (
+        getattr(settings, "enabled", True) if hasattr(settings, "enabled") else True
+    )
+
+    exact_grp_cnt = (
+        int(arts.exact_duplicate_groups["duplicate_group_id"].nunique())
+        if not arts.exact_duplicate_groups.empty
+        and "duplicate_group_id" in arts.exact_duplicate_groups.columns
+        else 0
+    )
+    exact_row_cnt = len(arts.exact_duplicate_groups)
+    near_grp_cnt = (
+        int(arts.near_duplicate_groups["near_duplicate_group_id"].nunique())
+        if not arts.near_duplicate_groups.empty
+        and "near_duplicate_group_id" in arts.near_duplicate_groups.columns
+        else 0
+    )
+    near_row_cnt = len(arts.near_duplicate_groups)
+    conflicting_cnt = (
+        int(arts.conflicting_duplicate_targets["signature"].nunique())
+        if not arts.conflicting_duplicate_targets.empty
+        and "signature" in arts.conflicting_duplicate_targets.columns
+        else 0
+    )
+
+    dup_analysis_payload = {
+        "status": "completed" if dup_enabled else "disabled",
+        "parameters": {
+            "rounding_decimals": dup_rounding,
+            "near_duplicate_threshold": dup_thresh,
+            "threshold_inclusive": True,
+            "maximum_pairwise_rows": dup_max_rows,
+            "include_target_in_signature": False,
+            "missing_equals_missing": True,
+            "transitive_closure": True,
+        },
+        "algorithm": {
+            "name": "canonical_match_fraction_connected_components",
+            "component_algorithm": "union_find",
+        },
+        "results": {
+            "exact_group_count": exact_grp_cnt,
+            "exact_row_count": exact_row_cnt,
+            "proper_near_group_count": near_grp_cnt,
+            "proper_near_row_count": near_row_cnt,
+            "conflicting_target_group_count": conflicting_cnt,
+        },
+    }
+
+    # Data dictionary section
+    dict_df = arts.numeric_predictor_dictionary
+    dict_total = len(dict_df)
+    dict_provided = (
+        int((dict_df["metadata_status"] == "provided").sum())
+        if not dict_df.empty and "metadata_status" in dict_df.columns
+        else 0
+    )
+    dict_not_provided = (
+        int((dict_df["metadata_status"] == "not_provided").sum())
+        if not dict_df.empty and "metadata_status" in dict_df.columns
+        else 0
+    )
+    derived_declared = (
+        int((dict_df["derived_status"] == "declared").sum())
+        if not dict_df.empty and "derived_status" in dict_df.columns
+        else 0
+    )
+    derived_not_declared = (
+        int((dict_df["derived_status"] == "not_declared").sum())
+        if not dict_df.empty and "derived_status" in dict_df.columns
+        else 0
+    )
+    derived_suspected = (
+        int((dict_df["derived_status"] == "suspected").sum())
+        if not dict_df.empty and "derived_status" in dict_df.columns
+        else 0
+    )
+    derived_not_eval = (
+        int((dict_df["derived_status"] == "not_evaluated").sum())
+        if not dict_df.empty and "derived_status" in dict_df.columns
+        else 0
+    )
+
+    data_dict_payload = {
+        "status": "completed",
+        "metadata_status_values": {
+            "provided": "Dictionary metadata was supplied for the predictor.",
+            "not_provided": "No dictionary metadata was supplied.",
+        },
+        "derived_status_values": {
+            "declared": "Metadata explicitly declares the predictor as derived.",
+            "not_declared": "Metadata was evaluated and does not declare derivation.",
+            "suspected": "Diagnostics identified a possible undeclared relation.",
+            "not_evaluated": "No derivation determination was made.",
+        },
+        "results": {
+            "predictor_count": dict_total,
+            "metadata_provided_count": dict_provided,
+            "metadata_not_provided_count": dict_not_provided,
+            "derived_declared_count": derived_declared,
+            "derived_not_declared_count": derived_not_declared,
+            "derived_suspected_count": derived_suspected,
+            "derived_not_evaluated_count": derived_not_eval,
+        },
+    }
+
+    # Derived relations section
+    derived_relations_payload = {
+        "status": "completed",
+        "results": {
+            "suspected_relation_count": len(arts.suspected_derived_relations),
+        },
+    }
+
+    # Context section
+    context_payload = {
+        "kind": context_kind,
+        "run_id": run_id,
+        "model_id": model_id,
+        "command": command
+        or ("diagnostics" if context_kind == "standalone" else "run"),
+    }
+
+    # Dataset section
+    if data_path is not None:
+        dataset_path_info = format_logical_dataset_path(
+            data_path, base_dir=output_directory
+        )
+    else:
+        dataset_path_info = {
+            "path": None,
+            "path_kind": "unknown",
+            "configured_path": None,
+        }
+
+    num_cols = (
+        int((dict_df["numeric"] == True).sum())  # noqa: E712
+        if not dict_df.empty and "numeric" in dict_df.columns
+        else 0
+    )
+
+    dataset_payload = {
+        "path": dataset_path_info.get("path"),
+        "path_kind": dataset_path_info.get("path_kind"),
+        "configured_path": dataset_path_info.get("configured_path"),
+        "sha256": data_hash,
+        "row_count": row_count,
+        "column_count": column_count,
+        "target": target,
+        "predictor_count": predictor_count
+        if predictor_count is not None
+        else dict_total,
+        "numeric_predictor_count": num_cols,
+    }
+
+    # Validation and Split Integrity top-level & analysis section
+    if validation_info is not None:
+        validation_payload = validation_info
+    else:
+        validation_payload = (
+            {"status": "not_applicable"} if context_kind == "standalone" else {}
+        )
+
+    if split_integrity_info is not None:
+        split_integrity_payload = split_integrity_info
+    else:
+        split_integrity_payload = (
+            {"status": "not_applicable"}
+            if context_kind == "standalone"
+            else {"status": "pending"}
+        )
+
+    manifest = {
+        "schema_name": DIAGNOSTICS_SCHEMA_NAME,
+        "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+        "generated_at_utc": utc_now(),
+        "generator": {
+            "application": "gam-app",
+            "application_version": __version__,
+        },
+        "context": context_payload,
+        "dataset": dataset_payload,
+        "analyses": {
+            "correlation": corr_analysis_payload,
+            "derived_relations": derived_relations_payload,
+            "duplicate_groups": dup_analysis_payload,
+            "data_dictionary": data_dict_payload,
+            "split_integrity": split_integrity_payload,
+        },
+        "validation": validation_payload,
+        "split_integrity": split_integrity_payload,
+        "artifacts": [entry.to_dict() for entry in artifact_entries],
+    }
+
+    manifest_path = output_directory / "diagnostics_manifest.json"
+    write_json_atomic(manifest_path, manifest)
+    return manifest_path
+
+
+def write_standalone_diagnostics(
+    *,
+    diagnostics: StandaloneDiagnostics | DiagnosticArtifacts,
+    output_directory: Path,
+    settings: StandaloneDiagnosticSettings,
+    data_path: Path | None = None,
+    target: str | None = None,
+    row_count: int | None = None,
+    column_count: int | None = None,
+    data_hash: str | None = None,
+) -> Path:
+    return write_diagnostics(
+        artifacts=diagnostics,
+        output_directory=output_directory,
+        context_kind="standalone",
+        settings=settings,
+        data_path=data_path,
+        target=target,
+        row_count=row_count,
+        column_count=column_count,
+        data_hash=data_hash,
+        command="profile",
     )

@@ -19,7 +19,7 @@ from .diagnostics import (
     write_standalone_diagnostics,
 )
 from .inspection import inspect_model, verify_link
-from .io_utils import read_json, write_yaml_atomic
+from .io_utils import read_json, sha256_file, write_yaml_atomic
 from .logistic import extract_class_score_parameters
 from .reporting import create_reports
 from .run_store import FileRunStore
@@ -80,10 +80,16 @@ def command_profile(args) -> None:
         settings=settings,
     )
 
+    data_hash = sha256_file(data_path)
     write_standalone_diagnostics(
         diagnostics=diagnostics,
         output_directory=output_directory,
         settings=settings,
+        data_path=data_path,
+        target=args.target,
+        row_count=len(frame),
+        column_count=len(frame.columns),
+        data_hash=data_hash,
     )
 
     print(json.dumps(profile, indent=2))

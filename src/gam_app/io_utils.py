@@ -88,6 +88,8 @@ def write_csv_atomic(
     *,
     index: bool = False,
     encoding: str = "utf-8",
+    float_format: str | None = None,
+    **kwargs: Any,
 ) -> None:
     path.parent.mkdir(
         parents=True,
@@ -101,6 +103,8 @@ def write_csv_atomic(
             temporary_path,
             index=index,
             encoding=encoding,
+            float_format=float_format,
+            **kwargs,
         )
         os.replace(
             temporary_path,

@@ -146,7 +146,8 @@ def test_near_group_contains_multiple_exact_signatures() -> None:
 
 
 def test_near_duplicate_groups_use_connected_components() -> None:
-    # A ~ B (1 mismatch out of 4), B ~ C (1 mismatch out of 4), A !~ C (2 mismatches out of 4)
+    # A ~ B (1 mismatch out of 4), B ~ C (1 mismatch out of 4),
+    # A !~ C (2 mismatches out of 4)
     X = pd.DataFrame(
         {
             "c1": [1, 1, 0],
