@@ -36,6 +36,7 @@ class RunSummary:
     tags: tuple[str, ...]
     metadata: Mapping[str, str]
     metadata_status: str  # "complete", "legacy", "incomplete", "invalid"
+    sensitivity_ids: tuple[str, ...] = ()
     created_run_path: str | None = None
     created_workspace_path: str | None = None
 
@@ -62,6 +63,7 @@ class RunSummary:
             "tags": list(self.tags),
             "metadata": dict(self.metadata),
             "metadata_status": self.metadata_status,
+            "sensitivity_ids": list(self.sensitivity_ids),
         }
 
 
@@ -73,6 +75,7 @@ class RunFilter:
     duplicate_group_policies: tuple[str, ...] = ()
     model_ids: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    sensitivity_ids: tuple[str, ...] = ()
     metadata_equals: tuple[tuple[str, str], ...] = ()
     created_after: datetime | None = None
     created_before: datetime | None = None
@@ -143,6 +146,25 @@ def _load_run_summary(run_dir: Path) -> RunSummary:
     phase = status_data.get("phase")
     updated_at_utc = status_data.get("updated_at_utc")
 
+    # Discover local sensitivity memberships
+    sens_ids: list[str] = []
+    sens_dir = run_dir / "sensitivity"
+    if sens_dir.is_dir():
+        for p in sens_dir.glob("*.json"):
+            try:
+                data = read_json(p)
+                sid = data.get("sensitivity_id")
+                if sid and data.get("schema_name") == "gam_sensitivity_membership":
+                    declared_mem_id = data.get("member_run_id")
+                    actual_run_id = str(run_data.get("run_id", run_dir.name))
+                    if declared_mem_id is None or declared_mem_id == actual_run_id:
+                        if sid not in sens_ids:
+                            sens_ids.append(sid)
+            except Exception:
+                pass
+
+    sorted_sens_ids = tuple(sorted(set(sens_ids)))
+
     schema_name = run_data.get("schema_name")
     is_v10_metadata = schema_name == RUN_METADATA_SCHEMA_NAME
 
@@ -176,6 +198,7 @@ def _load_run_summary(run_dir: Path) -> RunSummary:
             tags=tuple(str(t) for t in tags),
             metadata={str(k): str(v) for k, v in meta.items()},
             metadata_status="complete" if status_json_path.is_file() else "incomplete",
+            sensitivity_ids=sorted_sens_ids,
             created_run_path=run_data.get("created_run_path"),
             created_workspace_path=run_data.get("created_workspace_path"),
         )
@@ -236,6 +259,7 @@ def _load_run_summary(run_dir: Path) -> RunSummary:
         tags=tuple(tags_list),
         metadata=meta_dict,
         metadata_status="legacy",
+        sensitivity_ids=sorted_sens_ids,
         created_run_path=run_data.get("created_run_path"),
         created_workspace_path=run_data.get("created_workspace_path"),
     )
@@ -338,6 +362,10 @@ def run_matches_filter(run: RunSummary, filters: RunFilter) -> bool:
     if filters.tags:
         run_tags_lower = {t.casefold() for t in run.tags}
         if any(req_tag.casefold() not in run_tags_lower for req_tag in filters.tags):
+            return False
+
+    if filters.sensitivity_ids:
+        if not any(sid in run.sensitivity_ids for sid in filters.sensitivity_ids):
             return False
 
     if filters.metadata_equals:

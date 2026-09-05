@@ -246,9 +246,21 @@ if (-not (Test-Path $ReportPath)) {
 Start-Process $ReportPath
 ```
 
-## 10. Inspect key diagnostic artifacts
+## 10. Inspect and review diagnostic package
+
+Review the diagnostic package for a run without modifying artifacts:
 
 ```powershell
+$ReviewOutput = Join-Path $RunPath "reviews\diagnostic_review.json"
+
+poetry run gam-app review-diagnostics `
+  --run $RunPath `
+  --output $ReviewOutput
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Diagnostic review failed."
+}
+
 $DiagnosticsPath = Join-Path $RunPath "diagnostics"
 
 $HighCorrFile = Join-Path $DiagnosticsPath "high_correlation_pairs.csv"
@@ -263,6 +275,32 @@ if (Test-Path $ConflictFile) {
     Import-Csv $ConflictFile |
       Format-Table
 }
+```
+
+## 10b. Manage sensitivity studies
+
+Link runs in a planned sensitivity analysis:
+
+```powershell
+$SensitivityOutput = Join-Path $Workspace "sensitivity\demo-study\sensitivity_manifest.json"
+
+poetry run gam-app create-sensitivity `
+  --workspace $Workspace `
+  --id demo-study `
+  --name "Demo Sensitivity Study" `
+  --reference-run $RunPath `
+  --variant-run $RunPath `
+  --vary search.C `
+  --invariant dataset `
+  --invariant target `
+  --output $SensitivityOutput
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Sensitivity study creation failed."
+}
+
+poetry run gam-app show-sensitivity `
+  --manifest $SensitivityOutput
 ```
 
 ## 11. Inspect model equations and verify link function
