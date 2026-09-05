@@ -5,10 +5,10 @@ reproducible binary and multiclass classification with penalized generalized
 additive models on tabular data.
 
 The application supports ordinary stratified, group-aware, and time-aware
-nested validation; predictor and duplicate diagnostics; resumable run
-execution; machine-readable artifacts; HTML reporting; model inspection;
-batch prediction; run comparison; and run discovery without requiring a
-database or external service.
+nested validation; predictor and duplicate diagnostics; diagnostic package review;
+sensitivity-study provenance; resumable run execution; machine-readable artifacts;
+HTML reporting; model inspection; batch prediction; paired run comparison;
+and run discovery without requiring a database or external service.
 
 ## Installation
 
@@ -145,6 +145,9 @@ For the audited Windows PowerShell workflow, including exit-code handling, JSON 
 - comparison of paired fold results
 - batch prediction with input-schema validation
 - HTML reports with validation and diagnostic summaries
+- diagnostic review command (`gam-app review-diagnostics`) to independently validate and summarize persisted diagnostic packages
+- sensitivity study management (`gam-app create-sensitivity`, `gam-app show-sensitivity`) linking reference and variant runs
+- strict paired-run comparability validation before calculating metric differences
 
 ## Validation strategies
 

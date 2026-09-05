@@ -13,6 +13,14 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from .comparison import (
+    assess_run_comparability,
+    compare_paired_run_results,
+    find_shared_sensitivity_context,
+    render_comparison_json,
+    render_comparison_text,
+    write_comparison_outputs,
+)
 from .config import (
     CURRENT_CONFIG_SCHEMA_VERSION,
     dump_config_dict,
@@ -24,6 +32,12 @@ from .config_migration import (
     migrate_config_payload,
 )
 from .data import infer_role, load_table, profile_data, save_profile
+from .diagnostic_review import (
+    render_review_json,
+    render_review_text,
+    review_diagnostics,
+    write_review_output,
+)
 from .diagnostics import (
     StandaloneDiagnosticSettings,
     calculate_standalone_diagnostics,
@@ -41,6 +55,15 @@ from .run_catalog import (
     parse_datetime_argument,
 )
 from .run_store import FileRunStore
+from .sensitivity import (
+    SENSITIVITY_INVARIANTS,
+    SENSITIVITY_MANIFEST_SCHEMA_NAME,
+    SensitivityDesignCheck,
+    SensitivityManifest,
+    SensitivityMember,
+    create_sensitivity_manifest,
+    render_sensitivity_text,
+)
 from .workflow import create_run_result, execute_run
 
 
@@ -550,6 +573,101 @@ def _parse_created_before_arg(value: str) -> Any:
     return parse_datetime_argument(value, is_end_of_day=True)
 
 
+def command_review_diagnostics(args) -> None:
+    review = review_diagnostics(
+        diagnostics_directory=args.run / "diagnostics",
+        run_directory=args.run,
+        verify_artifacts=getattr(args, "verify_artifacts", True),
+    )
+
+    if args.output is not None:
+        write_review_output(review, args.output, overwrite=args.overwrite)
+
+    if getattr(args, "json", False):
+        print(render_review_json(review))
+    else:
+        print(render_review_text(review))
+
+    if review.package_status != "valid":
+        sys.exit(2)
+
+    if args.strict and review.scientific_priority == "warning":
+        sys.exit(2)
+
+
+def command_create_sensitivity(args) -> None:
+    manifest = create_sensitivity_manifest(
+        workspace=args.workspace,
+        sensitivity_id=args.sensitivity_id,
+        name=args.name,
+        description=args.description,
+        reference_run=args.reference_run,
+        variant_runs=args.variant_run,
+        vary=args.vary,
+        invariants=args.invariant,
+        output=args.output,
+        overwrite=args.overwrite,
+    )
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                manifest.to_dict(),
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    else:
+        print(render_sensitivity_text(manifest))
+
+
+def command_show_sensitivity(args) -> None:
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Sensitivity manifest file not found: {manifest_path}")
+
+    data = read_json(manifest_path)
+    if data.get("schema_name") != SENSITIVITY_MANIFEST_SCHEMA_NAME:
+        raise ValueError(f"File {manifest_path} is not a valid sensitivity manifest.")
+
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False))
+    else:
+        members = [
+            SensitivityMember(
+                run_id=m["run_id"],
+                run_path=Path(m["path"]),
+                role=m["role"],
+                label=m["label"],
+                varied_settings=m.get("varied_settings", {}),
+            )
+            for m in data.get("members", [])
+        ]
+        checks = [
+            SensitivityDesignCheck(
+                check=c["check"],
+                level=c["level"],
+                details=c["details"],
+            )
+            for c in data.get("checks", [])
+        ]
+        manifest = SensitivityManifest(
+            sensitivity_id=data["sensitivity_id"],
+            name=data["name"],
+            description=data.get("description"),
+            created_at_utc=data["created_at_utc"],
+            reference_run_id=data["reference_run_id"],
+            members=tuple(members),
+            declared_varied_paths=tuple(data.get("declared_varied_paths", [])),
+            expected_invariants=tuple(data.get("expected_invariants", [])),
+            status=data["status"],
+            checks=tuple(checks),
+            pairwise_comparability=tuple(data.get("pairwise_comparability", [])),
+        )
+        print(render_sensitivity_text(manifest))
+
+
 def command_list_runs(args) -> None:
     parsed_metadata_equals: list[tuple[str, str]] = []
     for raw_item in args.metadata:
@@ -567,6 +685,7 @@ def command_list_runs(args) -> None:
         duplicate_group_policies=tuple(args.duplicate_policy),
         model_ids=tuple(args.model),
         tags=tuple(args.tag),
+        sensitivity_ids=tuple(args.sensitivity),
         metadata_equals=tuple(parsed_metadata_equals),
         created_after=args.created_after,
         created_before=args.created_before,
@@ -601,6 +720,8 @@ def command_list_runs(args) -> None:
             active_filters["model_ids"] = list(filters.model_ids)
         if filters.tags:
             active_filters["tags"] = list(filters.tags)
+        if filters.sensitivity_ids:
+            active_filters["sensitivity_ids"] = list(filters.sensitivity_ids)
         if filters.metadata_equals:
             active_filters["metadata"] = dict(filters.metadata_equals)
         if filters.created_after:
@@ -759,25 +880,98 @@ def command_verify_link(args) -> None:
 
 
 def command_compare(args) -> None:
-    left = pd.read_csv(args.left / "results" / args.left_model / "fold_metrics.csv")
-    right = pd.read_csv(args.right / "results" / args.right_model / "fold_metrics.csv")
-    merged = left.merge(
-        right,
-        on=["repeat", "fold"],
-        suffixes=("_left", "_right"),
-        validate="one_to_one",
+    if not args.check_only and args.output is None:
+        raise ValueError("--output is required unless --check-only is used.")
+
+    sens_ctx = find_shared_sensitivity_context(
+        args.left,
+        args.right,
+        requested_sensitivity_id=getattr(args, "sensitivity", None),
     )
-    metrics = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
-    for metric in metrics:
-        merged[f"{metric}_difference"] = (
-            merged[f"{metric}_right"] - merged[f"{metric}_left"]
+
+    assessment = assess_run_comparability(
+        left_run=args.left,
+        left_model=args.left_model,
+        right_run=args.right,
+        right_model=args.right_model,
+    )
+
+    json_mode = getattr(args, "json", False)
+
+    if not assessment.comparable:
+        if json_mode:
+            print(
+                render_comparison_json(
+                    assessment,
+                    result=None,
+                    output_directory=args.output,
+                    check_only=args.check_only,
+                    sensitivity_context=sens_ctx,
+                )
+            )
+        else:
+            print(
+                render_comparison_text(
+                    assessment,
+                    result=None,
+                    sensitivity_context=sens_ctx,
+                )
+            )
+        sys.exit(2)
+
+    if args.check_only:
+        if json_mode:
+            print(
+                render_comparison_json(
+                    assessment,
+                    result=None,
+                    output_directory=args.output,
+                    check_only=True,
+                    sensitivity_context=sens_ctx,
+                )
+            )
+        else:
+            print(
+                render_comparison_text(
+                    assessment,
+                    result=None,
+                    sensitivity_context=sens_ctx,
+                )
+            )
+        sys.exit(0)
+
+    result = compare_paired_run_results(
+        left_run=args.left,
+        left_model=args.left_model,
+        right_run=args.right,
+        right_model=args.right_model,
+        sensitivity_context=sens_ctx,
+    )
+
+    write_comparison_outputs(
+        result=result,
+        output_directory=args.output,
+        overwrite=args.overwrite,
+    )
+
+    if json_mode:
+        print(
+            render_comparison_json(
+                assessment=result.assessment,
+                result=result,
+                output_directory=args.output,
+                check_only=False,
+                sensitivity_context=sens_ctx,
+            )
         )
-    args.output.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(args.output / "comparison.csv", index=False)
-    merged[[f"{metric}_difference" for metric in metrics]].agg(
-        ["mean", "std", "median"]
-    ).T.to_csv(args.output / "summary.csv")
-    print((args.output / "summary.csv").read_text(encoding="utf-8"))
+    else:
+        print(
+            render_comparison_text(
+                assessment=result.assessment,
+                result=result,
+                sensitivity_context=sens_ctx,
+            )
+        )
 
 
 def _component_type(
@@ -2964,7 +3158,11 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--left-model", required=True)
     compare.add_argument("--right", type=Path, required=True)
     compare.add_argument("--right-model", required=True)
-    compare.add_argument("--output", type=Path, required=True)
+    compare.add_argument("--output", type=Path, default=None)
+    compare.add_argument("--check-only", action="store_true")
+    compare.add_argument("--json", action="store_true")
+    compare.add_argument("--overwrite", action="store_true")
+    compare.add_argument("--sensitivity", type=str, default=None)
     compare.set_defaults(func=command_compare)
     predict = sub.add_parser("predict")
     predict.add_argument("--model", type=Path, required=True)
@@ -3125,6 +3323,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
     )
     list_runs.add_argument(
+        "--sensitivity",
+        action="append",
+        default=[],
+    )
+    list_runs.add_argument(
         "--strategy",
         choices=[
             "stratified",
@@ -3188,6 +3391,117 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     list_runs.set_defaults(func=command_list_runs)
+
+    create_sens = sub.add_parser(
+        "create-sensitivity",
+        help="Create a manifest linking runs in a planned sensitivity analysis.",
+    )
+    create_sens.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path("workspace"),
+    )
+    create_sens.add_argument(
+        "--id",
+        required=True,
+        dest="sensitivity_id",
+    )
+    create_sens.add_argument(
+        "--name",
+        required=True,
+    )
+    create_sens.add_argument(
+        "--description",
+        default=None,
+    )
+    create_sens.add_argument(
+        "--reference-run",
+        type=Path,
+        required=True,
+    )
+    create_sens.add_argument(
+        "--variant-run",
+        type=Path,
+        action="append",
+        default=[],
+        required=True,
+    )
+    create_sens.add_argument(
+        "--vary",
+        action="append",
+        default=[],
+        metavar="CONFIG_PATH",
+    )
+    create_sens.add_argument(
+        "--invariant",
+        action="append",
+        default=[],
+        choices=sorted(SENSITIVITY_INVARIANTS),
+    )
+    create_sens.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+    )
+    create_sens.add_argument(
+        "--overwrite",
+        action="store_true",
+    )
+    create_sens.add_argument(
+        "--json",
+        action="store_true",
+    )
+    create_sens.set_defaults(func=command_create_sensitivity)
+
+    show_sens = sub.add_parser(
+        "show-sensitivity",
+        help="Display a sensitivity study manifest.",
+    )
+    show_sens.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+    )
+    show_sens.add_argument(
+        "--json",
+        action="store_true",
+    )
+    show_sens.set_defaults(func=command_show_sensitivity)
+
+    review = sub.add_parser(
+        "review-diagnostics",
+        help="Validate and summarize persisted diagnostic artifacts for a run.",
+    )
+    review.add_argument(
+        "--run",
+        type=Path,
+        required=True,
+    )
+    review.add_argument(
+        "--json",
+        action="store_true",
+    )
+    review.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Persist the review JSON to this path.",
+    )
+    review.add_argument(
+        "--overwrite",
+        action="store_true",
+    )
+    review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return exit code 2 for warning-level scientific findings as well as invalid diagnostic packages.",
+    )
+    review.add_argument(
+        "--verify-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    review.set_defaults(func=command_review_diagnostics)
 
     return parser
 

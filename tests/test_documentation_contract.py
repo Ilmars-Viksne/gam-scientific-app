@@ -1,7 +1,9 @@
 import re
 from pathlib import Path
 from typing import Any, cast
+
 import pytest
+
 from gam_app.cli import build_parser
 
 DOCUMENTED_COMMANDS = (
@@ -23,6 +25,9 @@ DOCUMENTED_COMMANDS = (
     "transform",
     "contributions",
     "grouped-contributions",
+    "review-diagnostics",
+    "create-sensitivity",
+    "show-sensitivity",
 )
 
 
