@@ -82,6 +82,31 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         stream.flush()
 
 
+def write_text_atomic(
+    path: Path,
+    content: str,
+    encoding: str = "utf-8",
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary_path.open("w", encoding=encoding) as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary_path,
+            path,
+        )
+    finally:
+        temporary_path.unlink(
+            missing_ok=True,
+        )
+
+
 def write_csv_atomic(
     frame: pd.DataFrame,
     path: Path,
