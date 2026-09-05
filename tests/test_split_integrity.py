@@ -331,3 +331,107 @@ def test_existing_manifest_is_revalidated_on_resume(tmp_path: Path) -> None:
 
     integrity = pd.read_csv(integrity_path)
     assert not integrity["passed"].all()
+
+
+def test_failed_integrity_persisted_before_raising_and_events_ordered(
+    tmp_path: Path,
+) -> None:
+    run_directory = setup_sample_run(tmp_path)
+    execute_run(run_directory)
+
+    split_path = run_directory / "split_manifest.csv"
+    manifest = pd.read_csv(split_path)
+
+    # Corrupt manifest to introduce train/test overlap
+    test_row_index = manifest.index[manifest["partition"] == "test"][0]
+    manifest.loc[test_row_index, "partition"] = "train"
+    manifest.to_csv(split_path, index=False)
+
+    with pytest.raises(
+        DataValidationError,
+        match="Split-integrity validation failed",
+    ):
+        execute_run(run_directory)
+
+    integrity_path = run_directory / "diagnostics" / "split_integrity.csv"
+    assert integrity_path.exists()
+
+    integrity = pd.read_csv(integrity_path)
+    failed_rows = integrity.loc[~integrity["passed"]]
+    assert not failed_rows.empty
+
+    manifest_path = run_directory / "diagnostics" / "diagnostics_manifest.json"
+    diagnostics_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    split_integrity_meta = diagnostics_manifest["split_integrity"]
+    assert split_integrity_meta["passed"] is False
+    assert split_integrity_meta["result_count"] == len(integrity)
+    assert split_integrity_meta["distinct_check_count"] == integrity["check"].nunique()
+    assert split_integrity_meta["failed_result_count"] == len(failed_rows)
+    assert diagnostics_manifest["validation"]["split_integrity_passed"] is False
+
+    events_path = run_directory / "events.jsonl"
+    events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    integrity_indices = [
+        index
+        for index, event in enumerate(events)
+        if event["event"] == "split_integrity_evaluated"
+    ]
+    failure_indices = [
+        index for index, event in enumerate(events) if event["event"] == "run_failed"
+    ]
+
+    assert integrity_indices
+    assert failure_indices
+    assert max(integrity_indices) < max(failure_indices)
+
+    latest_integrity_event = events[max(integrity_indices)]
+    assert latest_integrity_event["passed"] is False
+    assert latest_integrity_event["failed_result_count"] == len(failed_rows)
+    assert (
+        latest_integrity_event["distinct_check_count"] == integrity["check"].nunique()
+    )
+    assert latest_integrity_event["artifact"] == "diagnostics/split_integrity.csv"
+
+
+def test_model_evaluation_not_called_on_integrity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = setup_sample_run(tmp_path)
+    execute_run(run_directory)
+
+    split_path = run_directory / "split_manifest.csv"
+    manifest = pd.read_csv(split_path)
+
+    test_row_index = manifest.index[manifest["partition"] == "test"][0]
+    manifest.loc[test_row_index, "partition"] = "train"
+    manifest.to_csv(split_path, index=False)
+
+    run_model_called = False
+
+    def unexpected_run_model(*args, **kwargs):
+        nonlocal run_model_called
+        run_model_called = True
+        raise AssertionError("run_model must not be called on integrity failure.")
+
+    import gam_app.workflow as workflow_module
+
+    monkeypatch.setattr(
+        workflow_module,
+        "run_model",
+        unexpected_run_model,
+    )
+
+    with pytest.raises(
+        DataValidationError,
+        match="Split-integrity validation failed",
+    ):
+        execute_run(run_directory)
+
+    assert run_model_called is False
