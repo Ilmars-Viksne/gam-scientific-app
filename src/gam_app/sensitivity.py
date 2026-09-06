@@ -459,40 +459,54 @@ def render_sensitivity_text(manifest: SensitivityManifest) -> str:
 
     lines.append("Declared Varied Paths:")
     if manifest.declared_varied_paths:
-        for p in manifest.declared_varied_paths:
-            lines.append(f"- {p}")
+        for varied_path in manifest.declared_varied_paths:
+            lines.append(f"- {varied_path}")
     else:
         lines.append("- none")
     lines.append("")
 
     lines.append("Expected Invariants:")
     if manifest.expected_invariants:
-        for inv in manifest.expected_invariants:
-            lines.append(f"- {inv}")
+        for invariant in manifest.expected_invariants:
+            lines.append(f"- {invariant}")
     else:
         lines.append("- none")
     lines.append("")
 
     lines.append("Members:")
-    for m in manifest.members:
-        lines.append(f"- [{m.role.upper()}] {m.run_id} ({m.run_path})")
-        if m.varied_settings:
-            for k, v in m.varied_settings.items():
-                lines.append(f"    {k} = {v}")
+    for member in manifest.members:
+        lines.append(f"- [{member.role.upper()}] {member.run_id} ({member.run_path})")
+
+        if member.varied_settings:
+            for setting_path, setting_value in member.varied_settings.items():
+                lines.append(f"    {setting_path} = {setting_value}")
+
     lines.append("")
 
     lines.append("Design Checks:")
-    for c in manifest.checks:
-        lines.append(f"- [{c.level.upper()}] {c.check}: {c.details}")
+    for check in manifest.checks:
+        lines.append(f"- [{check.level.upper()}] {check.check}: {check.details}")
+
     lines.append("")
 
     lines.append("Pairwise Comparability:")
-    for p in manifest.pairwise_comparability:
-        comp_str = "PASS" if p["comparable"] else "FAIL"
-        lines.append(f"- {p['reference_run_id']} vs {p['variant_run_id']}: {comp_str}")
-        if p["failed_checks"]:
-            lines.append(f"    Failed: {p['failed_checks']}")
-        if p["warning_checks"]:
-            lines.append(f"    Warnings: {p['warning_checks']}")
+    for comparison in manifest.pairwise_comparability:
+        comparison_status = "PASS" if comparison["comparable"] else "FAIL"
+
+        lines.append(
+            f"- {comparison['reference_run_id']} vs "
+            f"{comparison['variant_run_id']}: "
+            f"{comparison_status}"
+        )
+
+        failed_checks = comparison["failed_checks"]
+
+        if failed_checks:
+            lines.append(f"    Failed: {failed_checks}")
+
+        warning_checks = comparison["warning_checks"]
+
+        if warning_checks:
+            lines.append(f"    Warnings: {warning_checks}")
 
     return "\n".join(lines)
