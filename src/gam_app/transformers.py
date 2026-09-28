@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import numpy as np
@@ -15,6 +16,54 @@ from sklearn.preprocessing import (
 from sklearn.utils.validation import check_is_fitted
 
 FloatArray = NDArray[np.float64]
+
+
+def _numeric_category_key(value: object) -> Decimal | None:
+    try:
+        numeric_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+    return numeric_value if numeric_value.is_finite() else None
+
+
+def _normalize_category_values(
+    values: pd.Series,
+    allowed_categories: list[str],
+) -> pd.Series:
+    allowed_set = set(allowed_categories)
+    numeric_categories: dict[Decimal, str] = {}
+    ambiguous_numeric_categories: set[Decimal] = set()
+
+    for category in allowed_categories:
+        numeric_key = _numeric_category_key(category)
+        if numeric_key is None:
+            continue
+
+        previous = numeric_categories.get(numeric_key)
+        if previous is not None and previous != category:
+            ambiguous_numeric_categories.add(numeric_key)
+        else:
+            numeric_categories[numeric_key] = category
+
+    normalized_values: list[object] = []
+    for value in values:
+        if pd.isna(value):
+            normalized_values.append(pd.NA)
+            continue
+
+        category = str(value)
+        if category not in allowed_set:
+            numeric_key = _numeric_category_key(category)
+            if (
+                numeric_key is not None
+                and numeric_key not in ambiguous_numeric_categories
+            ):
+                category = numeric_categories.get(numeric_key, category)
+
+        normalized_values.append(category)
+
+    return pd.Series(normalized_values, index=values.index, dtype="string")
 
 
 class GAMFeatureTransformer(
@@ -625,8 +674,9 @@ class GAMFeatureTransformer(
 
                 self.categorical_imputers_[feature_name] = imputer
 
-                categorical_data[feature_name] = categorical_data[feature_name].astype(
-                    "string"
+                categorical_data[feature_name] = _normalize_category_values(
+                    categorical_data[feature_name],
+                    allowed_categories,
                 )
 
                 observed_categories = set(
@@ -830,7 +880,11 @@ class GAMFeatureTransformer(
                 list(self.categorical_features),
             ].copy()
 
-            for feature_name in self.categorical_features:
+            for feature_name, allowed_categories in zip(
+                self.categorical_features,
+                self.categorical_encoder_.categories_,
+                strict=True,
+            ):
                 imputer = self.categorical_imputers_[feature_name]
 
                 column = categorical_data.loc[
@@ -852,10 +906,9 @@ class GAMFeatureTransformer(
                         feature_name,
                     ] = imputed_values
 
-                # The categories supplied during fit are strings.
-                # Transform-time values must use the same representation.
-                categorical_data[feature_name] = categorical_data[feature_name].astype(
-                    "string"
+                categorical_data[feature_name] = _normalize_category_values(
+                    categorical_data[feature_name],
+                    [str(category) for category in allowed_categories],
                 )
 
             try:

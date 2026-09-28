@@ -12,6 +12,7 @@ import yaml
 from gam_app.comparison import (
     assess_run_comparability,
     compare_paired_run_results,
+    write_comparison_manifest,
 )
 from gam_app.exceptions import RunComparabilityError
 
@@ -132,6 +133,42 @@ def test_same_run_two_models_comparable(tmp_path: Path) -> None:
     )
     assert res.summary is not None
     assert len(res.summary) == 4
+
+
+def test_current_run_metadata_data_hash_is_supported(tmp_path: Path) -> None:
+    run1 = create_mock_run(tmp_path, "run-1")
+    run2 = create_mock_run(tmp_path, "run-2")
+    for run_dir in (run1, run2):
+        run_json_path = run_dir / "run.json"
+        run_json = json.loads(run_json_path.read_text(encoding="utf-8"))
+        run_json.pop("dataset_hash")
+        run_json.pop("data")
+        run_json["data_hash"] = "abc123sha256"
+        run_json["dataset"] = {"data_hash": "abc123sha256"}
+        run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+
+    assessment = assess_run_comparability(
+        left_run=run1,
+        left_model="gam_main",
+        right_run=run2,
+        right_model="gam_pairwise",
+    )
+    result = compare_paired_run_results(
+        left_run=run1,
+        left_model="gam_main",
+        right_run=run2,
+        right_model="gam_pairwise",
+    )
+    manifest_dir = tmp_path / "comparison"
+    manifest_dir.mkdir()
+    write_comparison_manifest(result, manifest_dir)
+    manifest = json.loads(
+        (manifest_dir / "comparison_manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert assessment.comparable
+    assert manifest["left"]["data_hash"] == "abc123sha256"
+    assert manifest["right"]["data_hash"] == "abc123sha256"
 
 
 def test_two_runs_identical_splits_comparable(tmp_path: Path) -> None:

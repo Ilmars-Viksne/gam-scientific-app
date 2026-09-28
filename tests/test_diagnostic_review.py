@@ -84,6 +84,25 @@ def test_valid_diagnostic_package_no_findings(tmp_path: Path) -> None:
     assert review.scientific_priority in {"none", "information"}
 
 
+def test_artifact_list_manifest_format(tmp_path: Path) -> None:
+    run_dir = create_mock_run(tmp_path, "run-1")
+    diag_dir = create_mock_diagnostics(run_dir)
+    manifest_path = diag_dir / "diagnostics_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"] = [
+        {"id": artifact_id, **artifact}
+        for artifact_id, artifact in manifest["artifacts"].items()
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    review = review_diagnostics(diagnostics_directory=diag_dir, run_directory=run_dir)
+
+    assert review.package_status == "valid"
+    assert [artifact.artifact_id for artifact in review.artifacts] == [
+        "split_integrity"
+    ]
+
+
 def test_correlation_warning_priority(tmp_path: Path) -> None:
     run_dir = create_mock_run(tmp_path, "run-1")
     diag_dir = create_mock_diagnostics(run_dir, warning_pair_count=2)

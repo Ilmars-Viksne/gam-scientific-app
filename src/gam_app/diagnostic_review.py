@@ -205,7 +205,20 @@ def review_diagnostics(
         package_status = "invalid"
 
     analyses = manifest_data.get("analyses") or {}
-    artifacts_dict = manifest_data.get("artifacts") or {}
+    raw_artifacts = manifest_data.get("artifacts") or {}
+    if isinstance(raw_artifacts, list):
+        artifacts_dict = {
+            str(artifact["id"]): artifact
+            for artifact in raw_artifacts
+            if isinstance(artifact, dict) and artifact.get("id") is not None
+        }
+        if len(artifacts_dict) != len(raw_artifacts):
+            package_status = "invalid"
+    elif isinstance(raw_artifacts, dict):
+        artifacts_dict = raw_artifacts
+    else:
+        artifacts_dict = {}
+        package_status = "invalid"
 
     # Verify artifacts if requested
     verification_status = "performed" if verify_artifacts else "not_performed"

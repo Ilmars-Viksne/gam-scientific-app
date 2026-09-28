@@ -175,6 +175,34 @@ def test_configured_category_absent_from_fit_data_is_supported() -> None:
     )
 
 
+def test_numeric_category_format_matches_configured_vocabulary() -> None:
+    training = pd.DataFrame(
+        {
+            "x1": [1.0, 2.0, 3.0, 4.0],
+            "x3": pd.Series([1, 1, 1, 1], dtype="int64"),
+        }
+    )
+    scenarios = pd.DataFrame(
+        {
+            "x1": [5.0, 6.0],
+            "x3": pd.Series([1, 0], dtype="int64"),
+        }
+    )
+    transformer = GAMFeatureTransformer(
+        smooth_features=("x1",),
+        linear_features=(),
+        categorical_features=("x3",),
+        categorical_levels=(("0.0", "0.5", "1.0"),),
+        interaction_pairs=(),
+    )
+
+    transformer.fit(training)
+    matrix = transformer.transform(scenarios)
+
+    assert matrix.shape[0] == len(scenarios)
+    assert np.isfinite(matrix).all()
+
+
 def test_linear_feature_standardization(tmp_path: Path) -> None:
     training = pd.DataFrame(
         {

@@ -76,6 +76,20 @@ class PairedComparisonResult:
     sensitivity_context: dict[str, Any] | None = None
 
 
+def _run_data_hash(run_json: dict[str, Any]) -> str | None:
+    data = run_json.get("data")
+    dataset = run_json.get("dataset")
+    data = data if isinstance(data, dict) else {}
+    dataset = dataset if isinstance(dataset, dict) else {}
+
+    return (
+        data.get("sha256")
+        or dataset.get("data_hash")
+        or run_json.get("data_hash")
+        or run_json.get("dataset_hash")
+    )
+
+
 def canonical_test_membership(split_manifest: pd.DataFrame) -> pd.DataFrame:
     required = {"repeat", "fold", "row_id", "partition"}
     if not required.issubset(split_manifest.columns):
@@ -322,12 +336,8 @@ def assess_run_comparability(
         )
 
     # Dataset hash equality
-    left_data_hash = left_comp["run_json"].get("data", {}).get("sha256") or left_comp[
-        "run_json"
-    ].get("dataset_hash")
-    right_data_hash = right_comp["run_json"].get("data", {}).get(
-        "sha256"
-    ) or right_comp["run_json"].get("dataset_hash")
+    left_data_hash = _run_data_hash(left_comp["run_json"])
+    right_data_hash = _run_data_hash(right_comp["run_json"])
 
     if not left_data_hash or not right_data_hash:
         checks.append(
@@ -831,8 +841,7 @@ def write_comparison_manifest(
             "run_id": left_json.get("run_id", left_run.name),
             "run_path": str(left_run.resolve()),
             "model_id": left_model,
-            "data_hash": left_json.get("data", {}).get("sha256")
-            or left_json.get("dataset_hash"),
+            "data_hash": _run_data_hash(left_json),
             "config_hash": left_json.get("config_hash"),
             "split_fingerprint": split_manifest_sha256(left_sm),
             "model_result_fingerprint": model_result_fingerprint(left_fm),
@@ -841,8 +850,7 @@ def write_comparison_manifest(
             "run_id": right_json.get("run_id", right_run.name),
             "run_path": str(right_run.resolve()),
             "model_id": right_model,
-            "data_hash": right_json.get("data", {}).get("sha256")
-            or right_json.get("dataset_hash"),
+            "data_hash": _run_data_hash(right_json),
             "config_hash": right_json.get("config_hash"),
             "split_fingerprint": split_manifest_sha256(right_sm),
             "model_result_fingerprint": model_result_fingerprint(right_fm),
