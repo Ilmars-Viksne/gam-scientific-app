@@ -334,7 +334,7 @@ Run `gam-app <command> --help` for the live parser help. These are the public co
 | `show-sensitivity` | `--manifest PATH [--json]`; display a sensitivity manifest. |
 | `review-diagnostics` | `--run DIR`; optional `--json`, `--output PATH`, `--overwrite`, `--strict`, and `--[no-]verify-artifacts`. |
 
-Planning emits exit code 2 when feasibility checks fail. Other command errors are printed to stderr and exit with code 1. For Windows PowerShell scripts that need robust exit-code handling, JSON parsing, and run-path recovery, follow [`docs/powershell-workflow.md`](docs/powershell-workflow.md).
+Planning emits exit code 2 when feasibility checks fail. Other command errors are printed to stderr and exit with code 1. For Windows PowerShell scripts that need robust exit-code handling, JSON parsing, and run-path recovery, see [`docs/powershell-workflow.md`](docs/powershell-workflow.md) and the reusable stages in `scripts/powershell/`.
 
 ## Artifacts and outputs
 
@@ -440,7 +440,7 @@ Not included are regression or other continuous-target models, causal-effect est
 
 ## Further documentation
 
-- [`docs/powershell-workflow.md`](docs/powershell-workflow.md): audited Windows workflow, exit-code handling, JSON parsing, run recovery, diagnostics review, inspection, prediction, comparisons, and validation variants.
+- [`docs/powershell-workflow.md`](docs/powershell-workflow.md): audited Windows workflow, reusable stages in `scripts/powershell/`, exit-code handling, JSON parsing, run recovery, diagnostics review, inspection, prediction, comparisons, and validation variants.
 - [`docs/scientific-interpretation.md`](docs/scientific-interpretation.md): extended mathematical formulation, validation guidance, metric interpretation, diagnostics, comparison conventions, scientific checklist, and reporting template.
 - [`examples/quick-demo.yaml`](examples/quick-demo.yaml): compact example configuration (schema 1.0, supported and migratable).
 - [`pyproject.toml`](pyproject.toml): package requirements, console script, optional development dependencies, and tool configuration.

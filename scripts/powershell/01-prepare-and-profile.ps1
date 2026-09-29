@@ -310,21 +310,21 @@ if ($HasOneHotTarget) {
     for ($Index = 0; $Index -lt $RawRows.Count; $Index++) {
         $Row = $RawRows[$Index]
         $LineNumber = $Index + 2
-        $ActiveFaults = [System.Collections.Generic.List[string]]::new()
+        $ActiveCategories = [System.Collections.Generic.List[string]]::new()
 
-        foreach ($Fault in $OneHotTargetColumns) {
+        foreach ($IndicatorColumn in $OneHotTargetColumns) {
             $Indicator = ConvertTo-BinaryIndicator `
-                -Value ([string] $Row.PSObject.Properties[$Fault].Value) `
-                -Column $Fault `
+                -Value ([string] $Row.PSObject.Properties[$IndicatorColumn].Value) `
+                -Column $IndicatorColumn `
                 -LineNumber $LineNumber
 
             if ($Indicator -eq 1) {
-                $ActiveFaults.Add($Fault)
+                $ActiveCategories.Add($IndicatorColumn)
             }
         }
 
-        if ($ActiveFaults.Count -ne 1) {
-            throw "CSV line $LineNumber has $($ActiveFaults.Count) active fault indicators; exactly one is required."
+        if ($ActiveCategories.Count -ne 1) {
+            throw "CSV line $LineNumber has $($ActiveCategories.Count) active target indicators; exactly one is required."
         }
 
         $Output = [ordered]@{}
@@ -352,7 +352,7 @@ if ($HasOneHotTarget) {
             }
         }
 
-        $Output[$TargetColumn] = $ActiveFaults[0]
+        $Output[$TargetColumn] = $ActiveCategories[0]
         $PreparedRows.Add([pscustomobject] $Output)
     }
 }

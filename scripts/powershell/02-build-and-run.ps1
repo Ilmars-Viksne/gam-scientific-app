@@ -433,7 +433,7 @@ Assert-ExitCode -Operation "plan" -ExitCode $PlanExitCode
 # -----------------------------------------------------------------------------
 # Run with one numerical-library thread per worker process.
 # -----------------------------------------------------------------------------
-$RunPathFile = Join-Path $Workspace "steel-$Strategy-$SessionId.txt"
+$RunPathFile = Join-Path $Workspace "$DatasetSlug-$Strategy-$SessionId.txt"
 $ThreadVariableNames = @(
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",

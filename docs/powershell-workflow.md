@@ -11,6 +11,28 @@ This guide provides a tested, copy-pasteable Windows PowerShell operational work
 
 All commands use `poetry run gam-app ...` to guarantee execution inside the managed environment.
 
+## Reusable staged workflow
+
+The reusable three-stage scripts are in `scripts/powershell/`. Run them from the repository root; each stage emits the path to its JSON handoff as its final pipeline output. Stage 1 accepts comma-, semicolon-, or tab-delimited text files and requires the existing categorical target column. It creates a row ID when needed, profiles the prepared data, and writes a feature-review worksheet. For datasets whose target is represented by mutually exclusive indicator columns, pass those columns explicitly with `-OneHotTargetColumns`; the target value will be the active column name.
+
+```powershell
+poetry run gam-app demo --output data/demo.csv --rows 300 --seed 42
+
+$Stage1Manifest = .\scripts\powershell\01-prepare-and-profile.ps1 `
+  -InputFile "data\demo.csv" `
+  -TargetColumn "Y" `
+  -SkipInstall | Select-Object -Last 1
+
+$RunManifest = .\scripts\powershell\02-build-and-run.ps1 `
+  -PreprocessingManifest $Stage1Manifest | Select-Object -Last 1
+
+.\scripts\powershell\03-postprocess-and-scenarios.ps1 `
+  -RunManifest $RunManifest `
+  -CompareModels
+```
+
+For one-hot targets, use for example `-TargetColumn "FaultClass" -OneHotTargetColumns @("FaultA", "FaultB", "FaultC")`. Stage 2 names configurations and tags using the dataset name from the Stage 1 handoff. Stage 3 can compare other models from the run with `-ComparisonLeftModel` and `-ComparisonRightModel`. Stage 1 prepares delimited text inputs; for Parquet or other supported profile formats, use the CLI workflow below directly.
+
 ## 1. Environment setup and verification
 
 ```powershell
